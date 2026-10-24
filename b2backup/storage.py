@@ -66,6 +66,19 @@ class HideMarkerError(Exception):
         return "\n".join(lines)
 
 
+class ParallelOperationError(Exception):
+    """Raised when one or more parallel operations fail."""
+    def __init__(self, message: str, errors: list[str]):
+        self.message = message
+        self.errors = errors
+        super().__init__(self._format_message())
+
+    def _format_message(self) -> str:
+        lines = [f"ERROR: {self.message}"]
+        lines.extend(f"  {e}" for e in self.errors)
+        return "\n".join(lines)
+
+
 def _iter_file_versions(bucket: Bucket):
     """Yield every file version in a bucket, recursively.
 
