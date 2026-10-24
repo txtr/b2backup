@@ -1,0 +1,19 @@
+# Copy to accounts.yaml (which should be git-ignored) and fill in real keys.
+#
+# Each application key must be able to list exactly one bucket and read/write
+# its objects. `capacity_in_mb` is an optional soft budget; omit it for an
+# account with no local limit.
+#
+# Get keys from: https://www.backblaze.com/b2/account.html
+# Create application key restricted to a single bucket.
+
+max_files_per_account: 1700
+
+accounts:
+  - account_id: "0011aabb22ccdd33"
+    account_key: "K001..."
+    capacity_in_mb: 10240
+
+  - account_id: "0044eeff55aa66bb"
+    account_key: "K004..."
+    # capacity_in_mb omitted = unlimited
