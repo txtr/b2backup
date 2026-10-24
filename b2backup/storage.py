@@ -210,63 +210,109 @@ class B2AccountPool:
             eligible.append(state)
         return eligible
 
+    def _get_eligible_accounts_sorted(
+        self,
+        file_size: int,
+        exclude: Optional[AccountState] = None
+    ) -> list[AccountState]:
+        """Get eligible accounts sorted by best-fit (best first)."""
+        eligible = self._eligible_accounts(file_size, exclude)
+        if not eligible:
+            return []
+
+        def remaining_after(s: AccountState) -> int:
+            rem = self._remaining_bytes(s)
+            return (rem - file_size) if rem is not None else 10**18
+
+        return sorted(eligible, key=lambda s: (remaining_after(s), s.account.account_id))
+
     def _pick_account(
         self,
         file_size: int,
         exclude: Optional[AccountState] = None
     ) -> AccountState:
-        """Best-fit: account with smallest remaining bytes after placement."""
-        eligible = self._eligible_accounts(file_size, exclude)
+        """Best-fit: account with smallest remaining bytes after placement.
+        
+        Returns the single best account (first in sorted eligible list).
+        Raises if no eligible accounts.
+        """
+        eligible = self._get_eligible_accounts_sorted(file_size, exclude)
         if not eligible:
             raise RuntimeError("No account has space/slots for this file")
+        return eligible[0]
 
-        # Best fit: smallest remaining_after
-        def remaining_after(s: AccountState) -> int:
-            rem = self._remaining_bytes(s)
-            return (rem - file_size) if rem is not None else 10**18
-
-        # Tie-break: account_id for determinism
-        return min(eligible, key=lambda s: (remaining_after(s), s.account.account_id))
+    def _try_upload_to_accounts(
+        self,
+        name: str,
+        data: bytes,
+        file_size: int,
+        eligible_accounts: list[AccountState],
+        action: str
+    ) -> Optional[AccountState]:
+        """Try uploading to each eligible account in order. Returns successful state or None."""
+        last_error = None
+        for state in eligible_accounts:
+            try:
+                state.bucket.upload_bytes(data, name)
+                state.used_bytes += file_size
+                state.file_count += 1
+                log.info("%s %s in %s (%.1fKB)", action, name, state.bucket_name, file_size / 1024)
+                return state
+            except Exception as e:
+                last_error = e
+                log.warning("Failed to %s %s to %s: %s; trying next account", action.lower(), name, state.bucket_name, e)
+                continue
+        
+        log.error("All %d eligible accounts failed for %s. Last error: %s. Skipping file.", 
+                  len(eligible_accounts), name, last_error)
+        return None
 
     def upload_file(self, name: str, local_path: Path) -> None:
-        """Upload or replace a file.
+        """Upload or replace a file with failover to next eligible account.
 
-        New file: pick best-fit account.
-        Replacement: pick best-fit account EXCLUDING current owner.
-        Atomic-ish: new version uploaded before old deleted.
+        New file: try best-fit accounts in order until one succeeds.
+        Replacement: try best-fit accounts (excluding current owner) in order.
+        If all accounts fail: log error and skip file (continue with next).
         """
         file_size = local_path.stat().st_size
         existing_state = self._cache.get(name)
+        data = local_path.read_bytes()
 
         if existing_state is None:
-            # New file
-            state = self._pick_account(file_size)
-            data = local_path.read_bytes()
-            state.bucket.upload_bytes(data, name)
-            state.used_bytes += file_size
-            state.file_count += 1
-            self._cache[name] = state
-            log.info("Created %s in %s (%.1fKB)", name, state.bucket_name, file_size / 1024)
+            # New file: try all eligible accounts
+            eligible = self._get_eligible_accounts_sorted(file_size)
+            if not eligible:
+                log.error("No eligible account has space/slots for %s (size=%.1fKB). Skipping.", 
+                          name, file_size / 1024)
+                return
+
+            state = self._try_upload_to_accounts(name, data, file_size, eligible, "Created")
+            if state:
+                self._cache[name] = state
+            # If None, error already logged, skip file
         else:
             # Replacement: must use DIFFERENT account
-            state = self._pick_account(file_size, exclude=existing_state)
-            data = local_path.read_bytes()
-            state.bucket.upload_bytes(data, name)
-            state.used_bytes += file_size
-            state.file_count += 1
+            eligible = self._get_eligible_accounts_sorted(file_size, exclude=existing_state)
+            if not eligible:
+                log.error("No eligible account (excluding current owner) has space/slots for %s (size=%.1fKB). Skipping.", 
+                          name, file_size / 1024)
+                return
 
-            # Update cache to new location
-            self._cache[name] = state
+            state = self._try_upload_to_accounts(name, data, file_size, eligible, "Replaced")
+            if state:
+                # Update cache to new location
+                self._cache[name] = state
 
-            # Best-effort delete old
-            try:
-                old_file = existing_state.bucket.get_file_info_by_name(name)
-                existing_state.bucket.delete_file_version(old_file.id_, name)
-                existing_state.used_bytes -= old_file.size
-                existing_state.file_count -= 1
-                log.info("Replaced %s: %s -> %s", name, existing_state.bucket_name, state.bucket_name)
-            except Exception as e:
-                log.warning("Replaced %s but failed to delete old version: %s", name, e)
+                # Best-effort delete old
+                try:
+                    old_file = existing_state.bucket.get_file_info_by_name(name)
+                    existing_state.bucket.delete_file_version(old_file.id_, name)
+                    existing_state.used_bytes -= old_file.size
+                    existing_state.file_count -= 1
+                    log.info("Replaced %s: %s -> %s", name, existing_state.bucket_name, state.bucket_name)
+                except Exception as e:
+                    log.warning("Replaced %s but failed to delete old version: %s", name, e)
+            # If None, error already logged, skip file
 
     def download_file(self, name: str, dest_path: Path) -> None:
         """Download a file by its stored name."""
