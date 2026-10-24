@@ -148,10 +148,18 @@ class B2AccountPool:
             versions_per_file: dict[str, list] = defaultdict(list)
 
             # Scan ALL versions recursively for true capacity tracking
+            log.info("Scanning bucket '%s' (account %s)...", state.bucket_name, state.account.account_id[:8])
+            scanned_count = 0
             for f in _iter_file_versions(state.bucket):
                 state.used_bytes += f.size
                 state.file_count += 1
                 versions_per_file[f.file_name].append(f)
+                scanned_count += 1
+                if scanned_count % 1000 == 0:
+                    log.info("  Scanned %d files...", scanned_count)
+
+            log.info("  Done: %d files (%.1fMB) in '%s'",
+                     scanned_count, state.used_bytes / 1024 / 1024, state.bucket_name)
 
             # Check for multiple versions within this account
             for name, versions in versions_per_file.items():
