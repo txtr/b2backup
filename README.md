@@ -151,13 +151,13 @@ _states: list[AccountState]       # All valid accounts
 ```mermaid
 flowchart TD
     A[Resolve source path] --> B[root_name = source.name]
-    B --> C[Walk source.rglob('*')]
-    C --> D[Filter is_file()]
+    B --> C[Walk source.rglob *]
+    C --> D[Filter is_file]
     D --> E{Any files?}
     E -->|No| F[Print "No files"; exit 0]
     E -->|Yes| G[For each file with tqdm]
-    G --> H[rel = file.relative_to(source.parent)]
-    H --> I[pool.upload_file(str(rel), file)]
+    G --> H[rel = file.relative_to source.parent]
+    H --> I[pool.upload_file str(rel), file]
     I --> J[Next file]
     J --> G
     G --> K[Print "Backup complete"]
@@ -211,12 +211,12 @@ Tie-break: account_id (deterministic)
 
 ```mermaid
 flowchart TD
-    A[pool.download_file(name, dest_path)] --> B[_cache.get(name)]
+    A[pool.download_file name, dest_path] --> B[_cache.get name]
     B --> C{Found?}
     C -->|No| D[Raise FileNotFoundError]
-    C -->|Yes| E[state.bucket.get_file_info_by_name(name)]
-    E --> F[state.bucket.download_file_by_id(file_id)]
-    F --> G[dest_path.write_bytes(content)]
+    C -->|Yes| E[state.bucket.get_file_info_by_name name]
+    E --> F[state.bucket.download_file_by_id file_id]
+    F --> G[dest_path.write_bytes content]
     G --> H[Done]
 ```
 
@@ -226,10 +226,10 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-    A[pool.list_files()] --> B[For each name, state in sorted(_cache)]
-    B --> C[file_obj = state.bucket.get_file_info_by_name(name)]
+    A[pool.list_files] --> B[For each name, state in sorted _cache]
+    B --> C[file_obj = state.bucket.get_file_info_by_name name]
     C --> D[Collect: name, size, timestamp, content_type, account_id]
-    D --> E[Return list[dict]]
+    D --> E[Return list dict]
     E --> F[CLI prints formatted table]
 ```
 
@@ -241,7 +241,7 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-    A[pool.get_pool_stats()] --> B[Aggregate totals from _states]
+    A[pool.get_pool_stats] --> B[Aggregate totals from _states]
     B --> C[For each state: compute remaining_bytes, remaining_files]
     C --> D[Return dict with totals + per-account breakdown]
     D --> E[CLI prints formatted table]
@@ -259,29 +259,29 @@ sequenceDiagram
     participant B2
 
     User->>CLI: b2backup --config=accounts.yaml backup /data
-    CLI->>Pool: B2AccountPool(accounts)
-    Pool->>B2: authorize_account() × N accounts
+    CLI->>Pool: B2AccountPool accounts
+    Pool->>B2: authorize_account × N accounts
     B2-->>Pool: Auth tokens
-    Pool->>B2: list_buckets() × N
+    Pool->>B2: list_buckets × N
     B2-->>Pool: Bucket list per account
     Pool->>Pool: CHECK 1: Each account MUST have exactly 1 bucket
     alt CHECK 1 FAILS (≠1 bucket)
         Pool->>User: Print offender table → exit 1
     else CHECK 1 PASSES
-        Pool->>B2: bucket.ls(latest_only=False) × N
+        Pool->>B2: bucket.ls latest_only=False × N
         B2-->>Pool: All file versions
-        Pool->>Pool: Aggregate used_bytes, file_count (ALL versions)
+        Pool->>Pool: Aggregate used_bytes, file_count ALL versions
         Pool->>Pool: CHECK 2: No file has >1 version in same account
-        alt CHECK 2 FAILS (intra-account versions)
+        alt CHECK 2 FAILS intra-account versions
             Pool->>User: Print per-account breakdown → exit 2
         else CHECK 2 PASSES
             Pool->>Pool: Pick latest per filename for cross-account check
-            Pool->>Pool: CHECK 3: No filename (latest) in ≥2 accounts
-            alt CHECK 3 FAILS (cross-account duplicates)
+            Pool->>Pool: CHECK 3: No filename latest in ≥2 accounts
+            alt CHECK 3 FAILS cross-account duplicates
                 Pool->>User: Print conflicts with timestamps → exit 2
             else ALL CHECKS PASS
                 Pool->>User: Log pool summary
-                CLI->>Pool: backup() → upload_file() × M files
+                CLI->>Pool: backup → upload_file × M files
             end
         end
     end
