@@ -7,7 +7,7 @@
 # Get keys from: https://www.backblaze.com/b2/account.html
 # Use the account ID and master application key for each account.
 
-max_files_per_account: 1700    # Ignored; accepted for b2router compatibility
+max_files_per_account: 1700    # Ignored (legacy field)
 
 accounts:
   - account_id: "0011aabb22ccdd33"

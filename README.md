@@ -326,9 +326,9 @@ Tie-break: account_id (lexicographic, deterministic)
 
 ## Configuration
 
-### `accounts.yaml` (compatible with b2router format)
+### `accounts.yaml`
 ```yaml
-max_files_per_account: 1700    # Ignored; accepted for b2router compatibility
+max_files_per_account: 1700    # Ignored (legacy field)
 
 accounts:
   - account_id: "ce6c123a9349"
@@ -352,7 +352,7 @@ strings, and duplicate `account_id` values are rejected.
 | `account_id` | Yes | B2 account ID (12-char hex) |
 | `account_key` | Yes | B2 master application key |
 | `capacity_in_mb` | No | Non-negative soft budget; omitted = unlimited |
-| `max_files_per_account` | No | Ignored; accepted for b2router compatibility |
+| `max_files_per_account` | No | Ignored (legacy field) |
 
 ---
 
@@ -456,22 +456,6 @@ Monitor `stats` output:
 | Multiple versions | Delete old versions in B2 console/CLI; restart |
 | Cross-account duplicates | Delete from all but one account; restart |
 | Account key revoked | Remove from config; re-backup affected files |
-
----
-
-## Comparison with b2router
-
-| Feature | b2router | b2backup |
-|---------|----------|----------|
-| Interface | HTTP API + UI | CLI only |
-| Concurrency | Multi-threaded, jobs | Single-threaded |
-| Auth | Bearer token, sessions | None |
-| Upserts | Async jobs, polling | Synchronous |
-| Replacements | Atomic, rollback on failure | Best-effort delete old |
-| Metrics | Prometheus `/metrics` | `stats` command |
-| Reconciliation | Built-in CLI | Manual (B2 console) |
-| Locking | `flock` single-writer | None (assume single user) |
-| Code size | ~3000 LOC | ~600 LOC |
 
 ---
 
