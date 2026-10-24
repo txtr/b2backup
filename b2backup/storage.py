@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 from b2sdk.v2 import B2Api, InMemoryAccountInfo, Bucket
-from .config import Account
+from .config import Account, Config
 
 _LOG_LEVEL = os.environ.get("B2BACKUP_LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
@@ -14,8 +14,6 @@ logging.basicConfig(
     format="%(levelname)s: %(message)s",
 )
 log = logging.getLogger(__name__)
-
-B2_MAX_FILES_PER_ACCOUNT = 1700
 
 
 class BucketValidationError(Exception):
@@ -92,9 +90,10 @@ class B2AccountPool:
         - used_bytes/file_count reflect ALL versions (for capacity tracking)
     """
 
-    def __init__(self, accounts: list[Account]):
+    def __init__(self, accounts: list[Account], max_files_per_account: int = 1700):
         self._states: list[AccountState] = []
         self._cache: dict[str, AccountState] = {}  # filename -> owning AccountState (latest)
+        self._max_files_per_account = max_files_per_account
 
         # Phase 1: Authorize and discover buckets
         account_buckets: list[tuple[Account, list[Bucket]]] = []
@@ -214,8 +213,8 @@ class B2AccountPool:
         return max(0, cap - state.used_bytes)
 
     def _remaining_files(self, state: AccountState) -> int:
-        """File slots remaining (B2 hard limit 1700)."""
-        return max(0, B2_MAX_FILES_PER_ACCOUNT - state.file_count)
+        """File slots remaining (configurable per-account budget)."""
+        return max(0, self._max_files_per_account - state.file_count)
 
     def _eligible_accounts(
         self,

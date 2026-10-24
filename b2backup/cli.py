@@ -11,16 +11,16 @@ from .storage import B2AccountPool, BucketValidationError, ConsistencyError
 def _get_pool(ctx):
     """Lazily create pool on first command that needs it."""
     if "pool" not in ctx.obj:
-        config = ctx.obj.get("config")
-        if not config:
+        config_path = ctx.obj.get("config")
+        if not config_path:
             raise click.UsageError("Missing --config")
         try:
-            accounts = load_config(str(config))
+            config = load_config(str(config_path))
         except ValueError as e:
             click.echo(f"ERROR: Invalid config: {e}", err=True)
             sys.exit(1)
         try:
-            ctx.obj["pool"] = B2AccountPool(accounts)
+            ctx.obj["pool"] = B2AccountPool(config.accounts, config.max_files_per_account)
         except BucketValidationError as e:
             click.echo(str(e), err=True)
             sys.exit(1)

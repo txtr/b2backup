@@ -19,7 +19,7 @@ A minimal, single-process CLI tool for backing up directories to a pool of Backb
 ## Constraints & Assumptions
 
 ### Backblaze B2 Constraints
-- **1,700 versions per account** (self-imposed budget; B2's list API paginates up to 10,000 entries per request)
+- **File-version budget per account** (configurable via `max_files_per_account`, default 1,700; B2's list API paginates up to 10,000 entries per request)
 - **One bucket per account**: Startup requires each account to expose exactly one bucket
 - **Master application keys**: Keys are assumed unrestricted; isolation comes from using one bucket per account
 - **Multiple accounts**: Workaround for a single unified namespace = multiple accounts, each with one bucket
@@ -352,7 +352,7 @@ strings, and duplicate `account_id` values are rejected.
 | `account_id` | Yes | B2 account ID (12-char hex) |
 | `account_key` | Yes | B2 master application key |
 | `capacity_in_mb` | No | Non-negative soft budget; omitted = unlimited |
-| `max_files_per_account` | No | Ignored (legacy field) |
+| `max_files_per_account` | No | Global file-version budget per account (default: 1700) |
 
 ---
 

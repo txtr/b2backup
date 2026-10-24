@@ -7,7 +7,7 @@
 # Get keys from: https://www.backblaze.com/b2/account.html
 # Use the account ID and master application key for each account.
 
-max_files_per_account: 1700    # Ignored (legacy field)
+max_files_per_account: 1700    # Global file-version budget per account (default: 1700)
 
 accounts:
   - account_id: "0011aabb22ccdd33"

@@ -12,14 +12,21 @@ class Account:
     capacity_in_mb: Optional[int] = None
 
 
-def load_config(path: str) -> list[Account]:
+@dataclass
+class Config:
+    """Full parsed configuration."""
+    accounts: list[Account]
+    max_files_per_account: int = 1700
+
+
+def load_config(path: str) -> Config:
     """Load accounts from YAML config file.
 
     Args:
         path: Path to accounts.yaml file.
 
     Returns:
-        List of Account objects.
+        Config object with accounts and global settings.
 
     Raises:
         FileNotFoundError: If config file doesn't exist.
@@ -37,6 +44,11 @@ def load_config(path: str) -> list[Account]:
     raw_accounts = data["accounts"]
     if not isinstance(raw_accounts, list):
         raise ValueError("'accounts' must be a list")
+
+    # Parse optional global max_files_per_account
+    max_files = data.get("max_files_per_account", 1700)
+    if not isinstance(max_files, int) or isinstance(max_files, bool) or max_files <= 0:
+        raise ValueError("'max_files_per_account' must be a positive integer")
 
     accounts = []
     seen_ids: set[str] = set()
@@ -71,4 +83,4 @@ def load_config(path: str) -> list[Account]:
     if not accounts:
         raise ValueError("At least one account is required")
 
-    return accounts
+    return Config(accounts=accounts, max_files_per_account=max_files)

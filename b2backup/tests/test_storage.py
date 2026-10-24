@@ -61,12 +61,72 @@ accounts:
   - account_id: "def456"
     account_key: "key2"
 """)
-    accounts = load_config(str(config_file))
-    assert len(accounts) == 2
-    assert accounts[0].account_id == "abc123"
-    assert accounts[0].capacity_in_mb == 10240
-    assert accounts[1].account_id == "def456"
-    assert accounts[1].capacity_in_mb is None
+    config = load_config(str(config_file))
+    assert config.max_files_per_account == 1700
+    assert len(config.accounts) == 2
+    assert config.accounts[0].account_id == "abc123"
+    assert config.accounts[0].capacity_in_mb == 10240
+    assert config.accounts[1].account_id == "def456"
+    assert config.accounts[1].capacity_in_mb is None
+
+
+def test_load_config_custom_max_files(tmp_path):
+    config_file = tmp_path / "accounts.yaml"
+    config_file.write_text("""
+max_files_per_account: 2000
+accounts:
+  - account_id: "abc123"
+    account_key: "key1"
+""")
+    config = load_config(str(config_file))
+    assert config.max_files_per_account == 2000
+
+
+def test_load_config_default_max_files(tmp_path):
+    config_file = tmp_path / "accounts.yaml"
+    config_file.write_text("""
+accounts:
+  - account_id: "abc123"
+    account_key: "key1"
+""")
+    config = load_config(str(config_file))
+    assert config.max_files_per_account == 1700  # default
+
+
+def test_load_config_rejects_invalid_max_files(tmp_path):
+    config_file = tmp_path / "accounts.yaml"
+    config_file.write_text("""
+max_files_per_account: -1
+accounts:
+  - account_id: "abc123"
+    account_key: "key1"
+""")
+    with pytest.raises(ValueError, match="max_files_per_account"):
+        load_config(str(config_file))
+
+
+def test_load_config_rejects_zero_max_files(tmp_path):
+    config_file = tmp_path / "accounts.yaml"
+    config_file.write_text("""
+max_files_per_account: 0
+accounts:
+  - account_id: "abc123"
+    account_key: "key1"
+""")
+    with pytest.raises(ValueError, match="max_files_per_account"):
+        load_config(str(config_file))
+
+
+def test_load_config_rejects_non_integer_max_files(tmp_path):
+    config_file = tmp_path / "accounts.yaml"
+    config_file.write_text("""
+max_files_per_account: "1700"
+accounts:
+  - account_id: "abc123"
+    account_key: "key1"
+""")
+    with pytest.raises(ValueError, match="max_files_per_account"):
+        load_config(str(config_file))
 
 
 def test_load_config_rejects_malformed_yaml(tmp_path):
@@ -141,7 +201,7 @@ def test_pool_initialization_builds_cache():
         mock_api.list_buckets.side_effect = [[bucket1], [bucket2]]
         mock_api.authorize_account.return_value = None
 
-        pool = B2AccountPool([account1, account2])
+        pool = B2AccountPool([account1, account2], 1700)
 
     assert len(pool._states) == 2
     assert len(pool._cache) == 2
@@ -166,7 +226,7 @@ def test_pool_scans_all_versions_recursively():
         mock_api_class.return_value = mock_api
         mock_api.list_buckets.return_value = [bucket1]
 
-        pool = B2AccountPool([account1])
+        pool = B2AccountPool([account1], 1700)
 
     bucket1.ls.assert_called_once_with(latest_only=False, recursive=True)
     assert pool._cache["nested/file.txt"] == pool._states[0]
@@ -193,7 +253,7 @@ def test_pool_detects_duplicate_at_startup():
         mock_api.list_buckets.side_effect = [[bucket1], [bucket2]]
 
         with pytest.raises(ConsistencyError, match="duplicate filenames across accounts"):
-            B2AccountPool([account1, account2])
+            B2AccountPool([account1, account2], 1700)
 
 
 def test_duplicate_report_includes_all_owners_and_timestamps():
@@ -214,7 +274,7 @@ def test_duplicate_report_includes_all_owners_and_timestamps():
         mock_api.list_buckets.side_effect = [[bucket1], [bucket2]]
 
         with pytest.raises(ConsistencyError) as excinfo:
-            B2AccountPool([account1, account2])
+            B2AccountPool([account1, account2], 1700)
 
     message = str(excinfo.value)
     assert "acc1" in message
@@ -239,7 +299,7 @@ def test_pool_rejects_accounts_with_wrong_bucket_count():
         mock_api.list_buckets.side_effect = [[bucket1], []]  # account2 has 0 buckets
 
         with pytest.raises(BucketValidationError, match="0 buckets"):
-            B2AccountPool([account1, account2])
+            B2AccountPool([account1, account2], 1700)
 
 
 def test_pick_account_best_fit():
@@ -252,7 +312,7 @@ def test_pick_account_best_fit():
         mock_api_class.return_value = mock_api
         mock_api.list_buckets.side_effect = [[bucket1], [bucket2]]
 
-        pool = B2AccountPool([account1, account2])
+        pool = B2AccountPool([account1, account2], 1700)
 
     # Manually set usage to test best-fit
     pool._states[0].used_bytes = 90 * 1024 * 1024  # 90MB used, 10MB free
@@ -274,7 +334,7 @@ def test_pick_account_excludes_source_for_replacement():
         mock_api_class.return_value = mock_api
         mock_api.list_buckets.side_effect = [[bucket1], [bucket2], [bucket3]]
 
-        pool = B2AccountPool([account1, account2, account3])
+        pool = B2AccountPool([account1, account2, account3], 1700)
 
     # File exists in account1
     pool._cache["test.txt"] = pool._states[0]
@@ -294,7 +354,7 @@ def test_upload_new_file(tmp_path):
         mock_api_class.return_value = mock_api
         mock_api.list_buckets.return_value = [bucket1]
 
-        pool = B2AccountPool([account1])
+        pool = B2AccountPool([account1], 1700)
 
     # Create a temp file
     test_file = tmp_path / "test.txt"
@@ -321,7 +381,7 @@ def test_upload_replacement_uses_different_account(tmp_path):
         mock_api_class.return_value = mock_api
         mock_api.list_buckets.side_effect = [[bucket1], [bucket2]]
 
-        pool = B2AccountPool([account1, account2])
+        pool = B2AccountPool([account1, account2], 1700)
 
     # Pre-populate cache: file exists in account1
     pool._cache["existing.txt"] = pool._states[0]
@@ -356,7 +416,7 @@ def _create_pool_with_cache(account, bucket, files):
         mock_api.list_buckets.return_value = [bucket]
         mock_api.authorize_account.return_value = None
 
-        pool = B2AccountPool([account])
+        pool = B2AccountPool([account], 1700)
 
     # Override cache with our test files
     pool._cache = {}
@@ -414,7 +474,7 @@ def test_get_pool_stats():
         mock_api_class.return_value = mock_api
         mock_api.list_buckets.side_effect = [[bucket1], [bucket2]]
 
-        pool = B2AccountPool([account1, account2])
+        pool = B2AccountPool([account1, account2], 1700)
 
     pool._states[0].used_bytes = 50 * 1024 * 1024
     pool._states[0].file_count = 10
@@ -440,7 +500,7 @@ def test_remaining_files_respects_b2_limit():
         mock_api_class.return_value = mock_api
         mock_api.list_buckets.return_value = [bucket1]
 
-        pool = B2AccountPool([account1])
+        pool = B2AccountPool([account1], 1700)
 
     pool._states[0].file_count = 1699
     assert pool._remaining_files(pool._states[0]) == 1
