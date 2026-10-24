@@ -82,16 +82,19 @@ b2backup/
 ┌─────────────────────────────────────────────────────────────────┐
 │                      B2AccountPool                               │
 ├─────────────────────────────────────────────────────────────────┤
-│  Startup (strict validation - no mutations if inconsistent):    │
+│  Startup (strict validation - HARD STOP on any inconsistency):  │
 │  1. Authorize each account_id/account_key                       │
 │  2. list_buckets() → MUST return exactly 1 bucket per account   │
-│  3. For each bucket: ls(latest_only=False)                      │
-│     - Sum used_bytes, file_count (ALL versions)                 │
-│     - Detect multiple versions per filename in same account     │
-│     - Pick latest version per filename for cross-account cache  │
+│     → If ANY account has ≠1 bucket: print offenders → exit 1    │
+│  3. For each bucket: ls(latest_only=False) — scan ALL versions  │
+│     - Sum used_bytes, file_count (ALL versions count)           │
+│     - If ANY file has >1 version in SAME account:               │
+│       print per-account breakdown → exit 2                      │
+│     - Pick latest version per filename for cross-account check  │
 │  4. Cross-account duplicate check on latest versions            │
-│  5. If ANY violation: print detailed report → exit (1 or 2)     │
-│  6. Log pool summary                                             │
+│     → If SAME filename (latest) in ≥2 accounts:                 │
+│       print conflicts with timestamps → exit 2                  │
+│  5. If ALL checks pass: log pool summary → proceed              │
 │                                                                  │
 │  Runtime:                                                        │
 │  - _pick_account(size, exclude) → best-fit eligible account     │
@@ -279,22 +282,22 @@ sequenceDiagram
     B2-->>Pool: Auth tokens
     Pool->>B2: list_buckets() × N
     B2-->>Pool: Bucket list per account
-    Pool->>Pool: Validate: each account MUST have exactly 1 bucket
-    alt Bucket count violation
+    Pool->>Pool: CHECK 1: Each account MUST have exactly 1 bucket
+    alt CHECK 1 FAILS (≠1 bucket)
         Pool->>User: Print offender table → exit 1
-    else All valid
+    else CHECK 1 PASSES
         Pool->>B2: bucket.ls(latest_only=False) × N
         B2-->>Pool: All file versions
-        Pool->>Pool: Aggregate used_bytes, file_count (all versions)
-        Pool->>Pool: Detect intra-account multiple versions
-        alt Multiple versions found
+        Pool->>Pool: Aggregate used_bytes, file_count (ALL versions)
+        Pool->>Pool: CHECK 2: No file has >1 version in same account
+        alt CHECK 2 FAILS (intra-account versions)
             Pool->>User: Print per-account breakdown → exit 2
-        else Clean
-            Pool->>Pool: Pick latest per filename for cache
-            Pool->>Pool: Cross-account duplicate check (latest only)
-            alt Cross-account duplicates found
-                Pool->>User: Print filename → accounts → exit 2
-            else Consistent
+        else CHECK 2 PASSES
+            Pool->>Pool: Pick latest per filename for cross-account check
+            Pool->>Pool: CHECK 3: No filename (latest) in ≥2 accounts
+            alt CHECK 3 FAILS (cross-account duplicates)
+                Pool->>User: Print conflicts with timestamps → exit 2
+            else ALL CHECKS PASS
                 Pool->>User: Log pool summary
                 CLI->>Pool: backup() → upload_file() × M files
             end
