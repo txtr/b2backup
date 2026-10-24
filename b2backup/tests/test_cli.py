@@ -47,12 +47,6 @@ def test_restore_command_help(runner, dummy_config):
     assert "Restore a file" in result.output
 
 
-def test_delete_command_help(runner, dummy_config):
-    result = runner.invoke(cli, ["--config", str(dummy_config), "delete", "--help"])
-    assert result.exit_code == 0
-    assert "Delete a file" in result.output
-
-
 def test_ls_command_help(runner, dummy_config):
     result = runner.invoke(cli, ["--config", str(dummy_config), "ls", "--help"])
     assert result.exit_code == 0

@@ -92,16 +92,6 @@ def restore(ctx, filename: str, dest: Path):
     click.echo("Done")
 
 
-@cli.command()
-@click.argument("filename")
-@click.pass_context
-def delete(ctx, filename: str):
-    """Delete a file by its stored name."""
-    pool: B2AccountPool = _get_pool(ctx)
-    pool.delete_file(filename)
-    click.echo(f"Deleted {filename}")
-
-
 @cli.command(name="ls")
 @click.pass_context
 def list_files(ctx):
