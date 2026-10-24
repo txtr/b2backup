@@ -1,11 +1,10 @@
 """Unit tests for b2backup with mocked B2 backend."""
 import pytest
 from pathlib import Path
-from unittest.mock import Mock, MagicMock, patch, PropertyMock
-from dataclasses import dataclass
+from unittest.mock import Mock, patch
 
 from b2backup.config import Account, load_config
-from b2backup.storage import B2AccountPool, AccountState
+from b2backup.storage import B2AccountPool
 
 
 class MockFileVersion:
@@ -22,7 +21,7 @@ class MockBucket:
         self.name = name
         self._files = files or []
 
-    def ls(self, latest_only=True):
+    def ls(self, latest_only=True, recursive=False):
         return self._files
 
     def get_file_info_by_name(self, name):
@@ -70,6 +69,61 @@ accounts:
     assert accounts[1].capacity_in_mb is None
 
 
+def test_load_config_rejects_malformed_yaml(tmp_path):
+    config_file = tmp_path / "accounts.yaml"
+    config_file.write_text("accounts: [\n")
+    with pytest.raises(ValueError, match="Invalid YAML"):
+        load_config(str(config_file))
+
+
+def test_load_config_rejects_invalid_capacity(tmp_path):
+    config_file = tmp_path / "accounts.yaml"
+    config_file.write_text("""
+accounts:
+  - account_id: "abc123"
+    account_key: "key1"
+    capacity_in_mb: "10240"
+""")
+    with pytest.raises(ValueError, match="capacity_in_mb"):
+        load_config(str(config_file))
+
+
+def test_load_config_rejects_negative_capacity(tmp_path):
+    config_file = tmp_path / "accounts.yaml"
+    config_file.write_text("""
+accounts:
+  - account_id: "abc123"
+    account_key: "key1"
+    capacity_in_mb: -1
+""")
+    with pytest.raises(ValueError, match="capacity_in_mb"):
+        load_config(str(config_file))
+
+
+def test_load_config_rejects_duplicate_account_ids(tmp_path):
+    config_file = tmp_path / "accounts.yaml"
+    config_file.write_text("""
+accounts:
+  - account_id: "abc123"
+    account_key: "key1"
+  - account_id: "abc123"
+    account_key: "key2"
+""")
+    with pytest.raises(ValueError, match="Duplicate account_id"):
+        load_config(str(config_file))
+
+
+def test_load_config_rejects_non_string_credentials(tmp_path):
+    config_file = tmp_path / "accounts.yaml"
+    config_file.write_text("""
+accounts:
+  - account_id: "abc123"
+    account_key: 12345
+""")
+    with pytest.raises(ValueError, match="account_key"):
+        load_config(str(config_file))
+
+
 def test_pool_initialization_builds_cache():
     """Test that pool builds cache and detects duplicates at startup."""
     account1, bucket1 = create_mock_account(
@@ -99,6 +153,28 @@ def test_pool_initialization_builds_cache():
     assert pool._states[1].file_count == 1
 
 
+def test_pool_scans_all_versions_recursively():
+    """Test that startup lists all versions recursively and handles b2sdk tuples."""
+    account1, bucket1 = create_mock_account("acc1", "bucket1")
+    bucket1.ls = Mock(return_value=[
+        (MockFileVersion("nested/file.txt", 100, 1000), None),
+        (MockFileVersion("folder", 0, 900), "folder/"),  # synthesized folder marker
+    ])
+
+    with patch("b2backup.storage.B2Api") as mock_api_class:
+        mock_api = Mock()
+        mock_api_class.return_value = mock_api
+        mock_api.list_buckets.return_value = [bucket1]
+
+        pool = B2AccountPool([account1])
+
+    bucket1.ls.assert_called_once_with(latest_only=False, recursive=True)
+    assert pool._cache["nested/file.txt"] == pool._states[0]
+    assert "folder" not in pool._cache
+    assert pool._states[0].used_bytes == 100
+    assert pool._states[0].file_count == 1
+
+
 def test_pool_detects_duplicate_at_startup():
     """Test that pool raises on duplicate filenames across accounts."""
     from b2backup.storage import ConsistencyError
@@ -118,6 +194,33 @@ def test_pool_detects_duplicate_at_startup():
 
         with pytest.raises(ConsistencyError, match="duplicate filenames across accounts"):
             B2AccountPool([account1, account2])
+
+
+def test_duplicate_report_includes_all_owners_and_timestamps():
+    """Test that both accounts and their latest timestamps are reported."""
+    from b2backup.storage import ConsistencyError
+    account1, bucket1 = create_mock_account(
+        "acc1", "bucket1",
+        files=[MockFileVersion("same.txt", 100, 1000)]
+    )
+    account2, bucket2 = create_mock_account(
+        "acc2", "bucket2",
+        files=[MockFileVersion("same.txt", 200, 2000)]
+    )
+
+    with patch("b2backup.storage.B2Api") as mock_api_class:
+        mock_api = Mock()
+        mock_api_class.return_value = mock_api
+        mock_api.list_buckets.side_effect = [[bucket1], [bucket2]]
+
+        with pytest.raises(ConsistencyError) as excinfo:
+            B2AccountPool([account1, account2])
+
+    message = str(excinfo.value)
+    assert "acc1" in message
+    assert "acc2" in message
+    assert "latest: 1000" in message
+    assert "latest: 2000" in message
 
 
 def test_pool_rejects_accounts_with_wrong_bucket_count():
@@ -156,7 +259,7 @@ def test_pick_account_best_fit():
     pool._states[1].used_bytes = 100 * 1024 * 1024  # 100MB used, 900MB free
 
     # 5MB file should go to account1 (10MB remaining -> 5MB after = best fit)
-    state = pool._pick_account(5 * 1024 * 1024)
+    state = pool._get_eligible_accounts_sorted(5 * 1024 * 1024)[0]
     assert state == pool._states[0]
 
 
@@ -177,7 +280,7 @@ def test_pick_account_excludes_source_for_replacement():
     pool._cache["test.txt"] = pool._states[0]
 
     # Replacement should NOT pick account1
-    state = pool._pick_account(100, exclude=pool._states[0])
+    state = pool._get_eligible_accounts_sorted(100, exclude=pool._states[0])[0]
     assert state != pool._states[0]
     assert state in (pool._states[1], pool._states[2])
 
@@ -281,26 +384,6 @@ def test_download_file():
 
     # Verify download was called
     bucket1.get_file_info_by_name.assert_called_with("test.txt")
-
-
-def test_delete_file():
-    """Test deleting a file."""
-    account1, bucket1 = create_mock_account(
-        "acc1", "b1",
-        files=[MockFileVersion("test.txt", 100, 1000)]
-    )
-
-    pool = _create_pool_with_cache(account1, bucket1, [MockFileVersion("test.txt", 100, 1000)])
-
-    bucket1.get_file_info_by_name = Mock(return_value=MockFileVersion("test.txt", 100, 1000))
-    bucket1.delete_file_version = Mock()
-
-    pool.delete_file("test.txt")
-
-    assert "test.txt" not in pool._cache
-    assert pool._states[0].file_count == 0
-    assert pool._states[0].used_bytes == 0
-    bucket1.delete_file_version.assert_called_once()
 
 
 def test_list_files():

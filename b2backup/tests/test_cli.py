@@ -1,6 +1,5 @@
 """CLI tests for b2backup."""
 import pytest
-from pathlib import Path
 from click.testing import CliRunner
 from unittest.mock import patch, Mock
 
@@ -45,6 +44,56 @@ def test_restore_command_help(runner, dummy_config):
     result = runner.invoke(cli, ["--config", str(dummy_config), "restore", "--help"])
     assert result.exit_code == 0
     assert "Restore a file" in result.output
+
+
+@patch("b2backup.cli.B2AccountPool")
+def test_restore_to_existing_directory(mock_pool_class, tmp_path, runner, dummy_config):
+    dest = tmp_path / "restored"
+    dest.mkdir()
+    mock_pool = Mock()
+    mock_pool_class.return_value = mock_pool
+
+    result = runner.invoke(
+        cli,
+        ["--config", str(dummy_config), "restore", "root/dir/file.txt", str(dest)],
+    )
+
+    assert result.exit_code == 0, result.output
+    mock_pool.download_file.assert_called_once_with(
+        "root/dir/file.txt", (dest / "file.txt").resolve()
+    )
+
+
+@patch("b2backup.cli.B2AccountPool")
+def test_restore_to_trailing_slash_destination(mock_pool_class, tmp_path, runner, dummy_config):
+    dest = tmp_path / "not-created-yet"
+    mock_pool = Mock()
+    mock_pool_class.return_value = mock_pool
+
+    result = runner.invoke(
+        cli,
+        ["--config", str(dummy_config), "restore", "root/dir/file.txt", str(dest) + "/"],
+    )
+
+    assert result.exit_code == 0, result.output
+    mock_pool.download_file.assert_called_once_with(
+        "root/dir/file.txt", (dest / "file.txt").resolve()
+    )
+
+
+@patch("b2backup.cli.B2AccountPool")
+def test_restore_to_explicit_file_path(mock_pool_class, tmp_path, runner, dummy_config):
+    dest = tmp_path / "renamed.txt"
+    mock_pool = Mock()
+    mock_pool_class.return_value = mock_pool
+
+    result = runner.invoke(
+        cli,
+        ["--config", str(dummy_config), "restore", "root/dir/file.txt", str(dest)],
+    )
+
+    assert result.exit_code == 0, result.output
+    mock_pool.download_file.assert_called_once_with("root/dir/file.txt", dest.resolve())
 
 
 def test_ls_command_help(runner, dummy_config):

@@ -1,7 +1,6 @@
 """Core B2 storage logic: account pool, cache, routing, and mutations."""
-import itertools
 import logging
-import sys
+import os
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
@@ -9,7 +8,11 @@ from typing import Optional
 from b2sdk.v2 import B2Api, InMemoryAccountInfo, Bucket
 from .config import Account
 
-logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+_LOG_LEVEL = os.environ.get("B2BACKUP_LOG_LEVEL", "INFO").upper()
+logging.basicConfig(
+    level=getattr(logging, _LOG_LEVEL, logging.INFO),
+    format="%(levelname)s: %(message)s",
+)
 log = logging.getLogger(__name__)
 
 B2_MAX_FILES_PER_ACCOUNT = 1700
@@ -26,7 +29,7 @@ class BucketValidationError(Exception):
         for acc, count, names in self.issues:
             bucket_list = ", ".join(names) if names else "(none)"
             lines.append(f"  {acc.account_id}: {count} buckets (expected 1) - {bucket_list}")
-        lines.append("Hint: Each application key must be restricted to exactly one bucket in B2 console.")
+        lines.append("Hint: Each account must contain exactly one bucket; remove or transfer extra buckets.")
         return "\n".join(lines)
 
 
@@ -41,6 +44,23 @@ class ConsistencyError(Exception):
         lines = [f"ERROR: {self.message}"]
         lines.extend(f"  {d}" for d in self.details)
         return "\n".join(lines)
+
+
+def _iter_file_versions(bucket: Bucket):
+    """Yield every file version in a bucket, recursively.
+
+    b2sdk 2.x ``Bucket.ls`` yields ``(FileVersion, folder_name)`` tuples;
+    older releases yielded ``FileVersion`` objects directly. Folder markers
+    are synthesized by ``ls`` and are not real files, so skip them.
+    """
+    for entry in bucket.ls(latest_only=False, recursive=True):
+        if isinstance(entry, tuple):
+            file_version, folder_name = entry
+            if folder_name is not None:
+                continue
+        else:
+            file_version = entry
+        yield file_version
 
 
 @dataclass
@@ -75,7 +95,6 @@ class B2AccountPool:
     def __init__(self, accounts: list[Account]):
         self._states: list[AccountState] = []
         self._cache: dict[str, AccountState] = {}  # filename -> owning AccountState (latest)
-        self._cycle = itertools.cycle(range(len(accounts)))
 
         # Phase 1: Authorize and discover buckets
         account_buckets: list[tuple[Account, list[Bucket]]] = []
@@ -121,14 +140,16 @@ class B2AccountPool:
 
     def _build_cache_and_validate(self) -> None:
         """Scan all buckets (all versions), validate consistency, compute usage."""
-        cross_duplicates: dict[str, list[AccountState]] = defaultdict(list)
+        # name -> [(owning state, latest FileVersion), ...] for files seen in >1 account
+        cross_duplicates: dict[str, list[tuple[AccountState, object]]] = defaultdict(list)
+        latest_versions: dict[str, tuple[AccountState, object]] = {}
         intra_duplicates: dict[str, dict[str, list]] = defaultdict(dict)  # account_id -> filename -> versions
 
         for state in self._states:
             versions_per_file: dict[str, list] = defaultdict(list)
 
-            # Scan ALL versions for true capacity tracking
-            for f in state.bucket.ls(latest_only=False):
+            # Scan ALL versions recursively for true capacity tracking
+            for f in _iter_file_versions(state.bucket):
                 state.used_bytes += f.size
                 state.file_count += 1
                 versions_per_file[f.file_name].append(f)
@@ -141,11 +162,14 @@ class B2AccountPool:
                         intra_duplicates[state.account.account_id] = {}
                     intra_duplicates[state.account.account_id][name] = versions
 
-                # Pick latest for cache
+                # Pick latest for cache / cross-account comparison
                 latest = max(versions, key=lambda v: v.upload_timestamp)
-                if name in self._cache:
-                    cross_duplicates[name].append(state)
+                if name in latest_versions:
+                    if name not in cross_duplicates:
+                        cross_duplicates[name].append(latest_versions[name])
+                    cross_duplicates[name].append((state, latest))
                 else:
+                    latest_versions[name] = (state, latest)
                     self._cache[name] = state
 
         # Phase 4: Report intra-account multiple versions
@@ -169,12 +193,13 @@ class B2AccountPool:
         # Phase 5: Report cross-account duplicate filenames (latest only)
         if cross_duplicates:
             details = []
-            for name, states in cross_duplicates.items():
+            for name, entries in cross_duplicates.items():
                 details.append(f"{name} exists in:")
-                for s in states:
-                    latest = s.bucket.get_file_info_by_name(name)
-                    ts = latest.upload_timestamp
-                    details.append(f"  - {s.account.account_id[:8]} ({s.bucket_name}) [latest: {ts}]")
+                for state, latest in entries:
+                    details.append(
+                        f"  - {state.account.account_id[:8]} ({state.bucket_name}) "
+                        f"[latest: {latest.upload_timestamp}]"
+                    )
             details.append("Hint: Delete duplicate from all but one account manually.")
             raise ConsistencyError(
                 "Consistency check failed - duplicate filenames across accounts",
@@ -225,21 +250,6 @@ class B2AccountPool:
             return (rem - file_size) if rem is not None else 10**18
 
         return sorted(eligible, key=lambda s: (remaining_after(s), s.account.account_id))
-
-    def _pick_account(
-        self,
-        file_size: int,
-        exclude: Optional[AccountState] = None
-    ) -> AccountState:
-        """Best-fit: account with smallest remaining bytes after placement.
-        
-        Returns the single best account (first in sorted eligible list).
-        Raises if no eligible accounts.
-        """
-        eligible = self._get_eligible_accounts_sorted(file_size, exclude)
-        if not eligible:
-            raise RuntimeError("No account has space/slots for this file")
-        return eligible[0]
 
     def _try_upload_to_accounts(
         self,
@@ -324,19 +334,6 @@ class B2AccountPool:
         content = state.bucket.download_file_by_id(file_obj.id_).response.content
         dest_path.parent.mkdir(parents=True, exist_ok=True)
         dest_path.write_bytes(content)
-
-    def delete_file(self, name: str) -> None:
-        """Delete a file by its stored name."""
-        state = self._cache.get(name)
-        if not state:
-            raise FileNotFoundError(name)
-
-        file_obj = state.bucket.get_file_info_by_name(name)
-        state.bucket.delete_file_version(file_obj.id_, name)
-        state.used_bytes -= file_obj.size
-        state.file_count -= 1
-        del self._cache[name]
-        log.info("Deleted %s from %s", name, state.bucket_name)
 
     def list_files(self) -> list[dict]:
         """List all files with metadata (live B2 lookup for freshness)."""

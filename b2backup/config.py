@@ -23,22 +23,49 @@ def load_config(path: str) -> list[Account]:
 
     Raises:
         FileNotFoundError: If config file doesn't exist.
-        ValueError: If YAML is malformed or missing required fields.
+        ValueError: If YAML is malformed or contains invalid values.
     """
     with open(path) as f:
-        data = yaml.safe_load(f)
+        try:
+            data = yaml.safe_load(f)
+        except yaml.YAMLError as e:
+            raise ValueError(f"Invalid YAML: {e}") from e
 
-    if not data or "accounts" not in data:
-        raise ValueError("Config must contain 'accounts' list")
+    if not isinstance(data, dict) or "accounts" not in data:
+        raise ValueError("Config must contain top-level 'accounts' list")
+
+    raw_accounts = data["accounts"]
+    if not isinstance(raw_accounts, list):
+        raise ValueError("'accounts' must be a list")
 
     accounts = []
-    for i, a in enumerate(data["accounts"]):
-        if "account_id" not in a or "account_key" not in a:
-            raise ValueError(f"Account {i} missing required fields (account_id, account_key)")
+    seen_ids: set[str] = set()
+    for i, a in enumerate(raw_accounts):
+        if not isinstance(a, dict):
+            raise ValueError(f"Account {i} must be a mapping")
+
+        account_id = a.get("account_id")
+        account_key = a.get("account_key")
+        if not isinstance(account_id, str) or not account_id.strip():
+            raise ValueError(f"Account {i}: 'account_id' must be a non-empty string")
+        if not isinstance(account_key, str) or not account_key.strip():
+            raise ValueError(f"Account {i}: 'account_key' must be a non-empty string")
+
+        capacity = a.get("capacity_in_mb")
+        if capacity is not None:
+            if isinstance(capacity, bool) or not isinstance(capacity, int) or capacity < 0:
+                raise ValueError(
+                    f"Account {i}: 'capacity_in_mb' must be a non-negative integer or omitted"
+                )
+
+        if account_id in seen_ids:
+            raise ValueError(f"Duplicate account_id '{account_id}'")
+        seen_ids.add(account_id)
+
         accounts.append(Account(
-            account_id=a["account_id"],
-            account_key=a["account_key"],
-            capacity_in_mb=a.get("capacity_in_mb"),
+            account_id=account_id,
+            account_key=account_key,
+            capacity_in_mb=capacity,
         ))
 
     if not accounts:

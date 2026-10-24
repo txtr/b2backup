@@ -1,13 +1,13 @@
 # Copy to accounts.yaml (which should be git-ignored) and fill in real keys.
 #
-# Each application key must be able to list exactly one bucket and read/write
-# its objects. `capacity_in_mb` is an optional soft budget; omit it for an
-# account with no local limit.
+# Keys are expected to be unrestricted master application keys. Each account
+# in the pool must contain exactly one bucket. `capacity_in_mb` is an optional
+# non-negative soft budget; omit it for an account with no local limit.
 #
 # Get keys from: https://www.backblaze.com/b2/account.html
-# Create application key restricted to a single bucket.
+# Use the account ID and master application key for each account.
 
-max_files_per_account: 1700
+max_files_per_account: 1700    # Ignored; accepted for b2router compatibility
 
 accounts:
   - account_id: "0011aabb22ccdd33"

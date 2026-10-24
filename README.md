@@ -6,7 +6,7 @@ A minimal, single-process CLI tool for backing up directories to a pool of Backb
 
 | Principle | Decision |
 |-----------|----------|
-| **Simplicity over features** | ~450 LOC total; no daemon, no HTTP, no job queue |
+| **Simplicity over features** | ~600 LOC total; no daemon, no HTTP, no job queue |
 | **Trust the user** | No auth, no rate limits, no CSRF, no CSP |
 | **B2 as source of truth** | Startup scan validates consistency; cache updated on mutations |
 | **Atomic upserts** | Replacements always go to a *different* account; old version deleted after |
@@ -19,9 +19,10 @@ A minimal, single-process CLI tool for backing up directories to a pool of Backb
 ## Constraints & Assumptions
 
 ### Backblaze B2 Constraints
-- **1700 files per bucket** (hard limit for `list_files` / `ls`)
-- **Per-application-key bucket access**: Each key must list exactly one bucket
-- **No native multi-bucket per key**: Workaround = multiple keys/accounts
+- **1,700 versions per account** (self-imposed budget; B2's list API paginates up to 10,000 entries per request)
+- **One bucket per account**: Startup requires each account to expose exactly one bucket
+- **Master application keys**: Keys are assumed unrestricted; isolation comes from using one bucket per account
+- **Multiple accounts**: Workaround for a single unified namespace = multiple accounts, each with one bucket
 - **All versions count against limits**: Hidden versions consume file slots and bytes
 - **Eventual consistency**: `list_buckets` / `ls` may lag seconds after mutations
 
@@ -46,6 +47,7 @@ A minimal, single-process CLI tool for backing up directories to a pool of Backb
 b2backup/
 ├── pyproject.toml          # Package metadata, deps, entry point
 ├── README.md               # This file
+├── LICENSE                 # MIT license
 ├── accounts.yaml.example   # Template config
 └── b2backup/
     ├── __init__.py         # Version
@@ -73,8 +75,8 @@ b2backup/
 │  Click command parser                                            │
 │  ├─ backup   → walk dir → upload_file() for each                │
 │  ├─ restore  → download_file()                                  │
-│  ├─ ls       → list_files() (from cache)                        │
-│  └─ stats    → get_pool_stats() (from cache + live check)       │
+│  ├─ ls       → list_files() (names from cache, metadata live)   │
+│  └─ stats    → get_pool_stats() (from cache)                    │
 └────────────────────────────────┬────────────────────────────────┘
                                  │
                                  ▼
@@ -85,7 +87,7 @@ b2backup/
 │  1. Authorize each account_id/account_key                       │
 │  2. list_buckets() → MUST return exactly 1 bucket per account   │
 │     → If ANY account has ≠1 bucket: print offenders → exit 1    │
-│  3. For each bucket: ls(latest_only=False) — scan ALL versions  │
+│  3. For each bucket: ls(latest_only=False, recursive=True)      │
 │     - Sum used_bytes, file_count (ALL versions count)           │
 │     - If ANY file has >1 version in SAME account:               │
 │       print per-account breakdown → exit 2                      │
@@ -96,8 +98,8 @@ b2backup/
 │  5. If ALL checks pass: log pool summary → proceed              │
 │                                                                  │
 │  Runtime:                                                        │
-│  - _pick_account(size, exclude) → best-fit eligible account     │
-│  - upload_file() → new: pick any; replace: pick ≠ source        │
+│  - _get_eligible_accounts_sorted(size, exclude) → best-fit list │
+│  - upload_file() → try accounts in order (failover on error)    │
 │  - Cache updated on every mutation                              │
 └────────────────────────────────┬────────────────────────────────┘
                                  │
@@ -130,7 +132,7 @@ class AccountState:
     bucket_name: str
     bucket: Bucket           # b2sdk Bucket handle
     used_bytes: int = 0      # Sum of ALL version sizes (for capacity)
-    file_count: int = 0      # Count of ALL versions (for 1700 limit)
+    file_count: int = 0      # Count of ALL versions (for 1700-version budget)
 ```
 
 ### Cache
@@ -168,27 +170,34 @@ upload_file(name, path)
     ├─ existing = _cache.get(name)
     │
     ├─ if existing is None:                    # NEW FILE
-    │     state = _pick_account(file_size)     # best-fit
-    │     state.bucket.upload_bytes(data, name)
-    │     state.used_bytes += file_size
-    │     state.file_count += 1
-    │     _cache[name] = state
+    │     eligible = _get_eligible_accounts_sorted(file_size)
+    │     if none: log error; skip file
+    │     for state in eligible:               # failover
+    │         try: state.bucket.upload_bytes(data, name)
+    │         on success:
+    │             state.used_bytes += file_size
+    │             state.file_count += 1
+    │             _cache[name] = state
+    │             return
     │
     └─ else:                                   # REPLACEMENT
-          state = _pick_account(file_size, exclude=existing)
-          state.bucket.upload_bytes(data, name)
-          state.used_bytes += file_size
-          state.file_count += 1
-          _cache[name] = state
-          try:
-              old = existing.bucket.get_file_info_by_name(name)
-              existing.bucket.delete_file_version(old.id_, name)
-              existing.used_bytes -= old.size
-              existing.file_count -= 1
-          except: log warning (duplicate remains)
+          eligible = _get_eligible_accounts_sorted(file_size, exclude=existing)
+          if none: log error; skip file
+          for state in eligible:               # failover, never the owner
+              try: state.bucket.upload_bytes(data, name)
+              on success:
+                  state.used_bytes += file_size
+                  state.file_count += 1
+                  _cache[name] = state
+                  try:
+                      old = existing.bucket.get_file_info_by_name(name)
+                      existing.bucket.delete_file_version(old.id_, name)
+                      existing.used_bytes -= old.size
+                      existing.file_count -= 1
+                  except: log warning (duplicate remains)
 ```
 
-**`_pick_account(size, exclude)`**:
+**`_get_eligible_accounts_sorted(size, exclude)`**:
 ```
 _eligible_accounts(size, exclude)
     For each state in _states (skip exclude):
@@ -198,8 +207,9 @@ _eligible_accounts(size, exclude)
             add to eligible
     return eligible
 
-Pick argmin(remaining_after) where remaining_after = rem_bytes - size
+Sort by remaining_after = rem_bytes - size (unlimited last)
 Tie-break: account_id (deterministic)
+upload_file tries accounts in that order until an upload succeeds.
 ```
 
 ---
@@ -207,13 +217,15 @@ Tie-break: account_id (deterministic)
 ### 2. `b2backup restore "EFG/HIJ/file.ext" ./dest/`
 
 ```
-1. pool.download_file(name, dest_path)
-2. _cache.get(name)
-3. If not found: raise FileNotFoundError
-4. state.bucket.get_file_info_by_name(name)
-5. state.bucket.download_file_by_id(file_id)
-6. dest_path.write_bytes(content)
-7. Done
+1. Resolve destination; if it is an existing directory or ends with "/",
+   append the source filename (e.g. ./dest/ -> ./dest/file.ext)
+2. pool.download_file(name, dest_path)
+3. _cache.get(name)
+4. If not found: raise FileNotFoundError
+5. state.bucket.get_file_info_by_name(name)
+6. state.bucket.download_file_by_id(file_id)
+7. dest_path.write_bytes(content)
+8. Done
 ```
 
 ---
@@ -254,7 +266,7 @@ Tie-break: account_id (deterministic)
 4. Pool calls list_buckets() for each account (× N)
 5. CHECK 1: Each account MUST have exactly 1 bucket
    - If FAIL: Print offender table → exit 1
-6. Pool calls bucket.ls(latest_only=False) for each bucket (× N)
+6. Pool calls bucket.ls(latest_only=False, recursive=True) for each bucket (× N)
 7. Aggregate used_bytes, file_count (ALL versions)
 8. CHECK 2: No file has >1 version in same account
    - If FAIL: Print per-account breakdown → exit 2
@@ -302,12 +314,11 @@ Tie-break: account_id (lexicographic, deterministic)
 | **Startup: cross-account duplicates** | Hard stop if same filename (latest) in ≥2 accounts; prints conflict |
 | **New file** | Written to exactly one account; cache updated atomically in-process |
 | **Replace file** | New version written to *different* account; old deleted after; cache points to new |
-| **Delete** | Removed from owning account; cache entry removed |
 | **Crash mid-upload** | Partial upload leaves no cache entry; B2 may have orphan object |
 | **Crash mid-replace** | New version in account B, old in account A → duplicate at next startup (caught) |
 
 **Recovery**: If startup fails, manually resolve in B2 console:
-- Bucket count: Restrict key to exactly one bucket
+- Bucket count: Remove or transfer extra buckets so the account has exactly one
 - Multiple versions: Delete old versions via B2 console/CLI
 - Cross-account duplicates: Delete from all but one account
 
@@ -317,7 +328,7 @@ Tie-break: account_id (lexicographic, deterministic)
 
 ### `accounts.yaml` (compatible with b2router format)
 ```yaml
-max_files_per_account: 1700    # Optional; informational only
+max_files_per_account: 1700    # Ignored; accepted for b2router compatibility
 
 accounts:
   - account_id: "ce6c123a9349"
@@ -328,14 +339,20 @@ accounts:
     # capacity_in_mb omitted = unlimited
 ```
 
+Each configured account must contain **exactly one bucket**. Keys are expected
+to be unrestricted master application keys; isolation comes from keeping one
+bucket per account. Config values are validated strictly:
+`capacity_in_mb` must be a non-negative integer, credentials must be non-empty
+strings, and duplicate `account_id` values are rejected.
+
 ### Field Reference
 
 | Field | Required | Description |
 |-------|----------|-------------|
-| `account_id` | Yes | B2 KeyID (12-char hex) |
-| `account_key` | Yes | B2 Application Key (starts with `005`) |
-| `capacity_in_mb` | No | Soft budget; `None` = unlimited |
-| `max_files_per_account` | No | Global default (1700); informational |
+| `account_id` | Yes | B2 account ID (12-char hex) |
+| `account_key` | Yes | B2 master application key |
+| `capacity_in_mb` | No | Non-negative soft budget; omitted = unlimited |
+| `max_files_per_account` | No | Ignored; accepted for b2router compatibility |
 
 ---
 
@@ -385,22 +402,22 @@ INFO:   ce6c123a (backup-1): 283 files, 1024MB used, remaining: 9216MB, 1417 slo
 INFO: Created photos/2024/IMG_123.jpg in backup-3 (2.4MB)
 INFO: Replaced docs/report.pdf: backup-1 -> backup-7
 WARNING: Replaced notes.txt but failed to delete old version: ...
-INFO: Deleted old/backup.zip from backup-12
 ```
 
-Set `B2BACKUP_LOG_LEVEL=DEBUG` for b2sdk HTTP traces.
+Set `B2BACKUP_LOG_LEVEL=DEBUG` for b2sdk HTTP traces. The level is read when
+`b2backup.storage` is imported.
 
 ---
 
 ## Testing
 
 ```bash
-# Unit tests (fake B2 backend)
+# Unit tests (mocked B2 backend; no real credentials required)
 pytest b2backup/tests/
-
-# Integration test (requires real B2 accounts)
-B2BACKUP_TEST_CONFIG=accounts.yaml pytest b2backup/tests/integration/
 ```
+
+There is no live integration test suite in this repository. Tests use a fake
+B2 backend, so they do not exercise real network/API behavior.
 
 Test coverage targets:
 - Routing logic (best-fit, exclusion, capacity bounds)
@@ -408,14 +425,15 @@ Test coverage targets:
 - CLI argument parsing and path handling
 - Error paths (missing file, no space, no eligible account)
 - Startup validation (bucket count, intra-versions, cross-duplicates)
+- Recursive all-version scanning and b2sdk `ls` tuple handling
 
 ---
 
 ## Operational Runbook
 
 ### Adding a New Account
-1. Create B2 application key restricted to one new bucket
-2. Add to `accounts.yaml`
+1. Create a B2 account that contains exactly one bucket
+2. Add its master credentials to `accounts.yaml`
 3. Run `b2backup --config=accounts.yaml stats` → verify appears in pool
 
 ### Removing an Account
@@ -434,7 +452,7 @@ Monitor `stats` output:
 |---------|----------|
 | Config lost | Recreate from B2: `list_buckets` → get keys → rebuild YAML |
 | Cache corrupted | Delete nothing; restart rebuilds from B2 |
-| Bucket count violation | Fix key restriction in B2 console; restart |
+| Bucket count violation | Remove or transfer extra buckets so the account has exactly one; restart |
 | Multiple versions | Delete old versions in B2 console/CLI; restart |
 | Cross-account duplicates | Delete from all but one account; restart |
 | Account key revoked | Remove from config; re-backup affected files |
@@ -453,7 +471,7 @@ Monitor `stats` output:
 | Metrics | Prometheus `/metrics` | `stats` command |
 | Reconciliation | Built-in CLI | Manual (B2 console) |
 | Locking | `flock` single-writer | None (assume single user) |
-| Code size | ~3000 LOC | ~450 LOC |
+| Code size | ~3000 LOC | ~600 LOC |
 
 ---
 

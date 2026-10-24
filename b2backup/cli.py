@@ -1,4 +1,5 @@
 """CLI commands for b2backup."""
+import os
 import sys
 from pathlib import Path
 import click
@@ -14,7 +15,12 @@ def _get_pool(ctx):
         if not config:
             raise click.UsageError("Missing --config")
         try:
-            ctx.obj["pool"] = B2AccountPool(load_config(str(config)))
+            accounts = load_config(str(config))
+        except ValueError as e:
+            click.echo(f"ERROR: Invalid config: {e}", err=True)
+            sys.exit(1)
+        try:
+            ctx.obj["pool"] = B2AccountPool(accounts)
         except BucketValidationError as e:
             click.echo(str(e), err=True)
             sys.exit(1)
@@ -77,18 +83,24 @@ def backup(ctx, source: Path):
 
 @cli.command()
 @click.argument("filename")
-@click.argument(
-    "dest",
-    type=click.Path(path_type=Path),
-)
+@click.argument("dest", type=click.Path())
 @click.pass_context
-def restore(ctx, filename: str, dest: Path):
+def restore(ctx, filename: str, dest: str):
     """Restore a file by its stored name (e.g., EFG/HIJ/KLM/file.ext)."""
     pool: B2AccountPool = _get_pool(ctx)
-    dest = dest.resolve()
+    dest_path = Path(dest).expanduser()
 
-    click.echo(f"Restoring {filename} -> {dest}")
-    pool.download_file(filename, dest)
+    # Treat an existing directory or a path ending in a separator as a directory.
+    dir_separators = {"/", os.sep}
+    if os.altsep:
+        dir_separators.add(os.altsep)
+    if dest_path.is_dir() or any(dest.endswith(sep) for sep in dir_separators):
+        dest_path = dest_path / Path(filename).name
+
+    dest_path = dest_path.resolve()
+
+    click.echo(f"Restoring {filename} -> {dest_path}")
+    pool.download_file(filename, dest_path)
     click.echo("Done")
 
 
