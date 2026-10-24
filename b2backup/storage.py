@@ -1,5 +1,6 @@
 """Core B2 storage logic: account pool, cache, routing, and mutations."""
 import logging
+import time
 import os
 from collections import defaultdict
 from dataclasses import dataclass
@@ -189,6 +190,7 @@ class B2AccountPool:
 
             # Scan ALL versions recursively for true capacity tracking
             log.info("Scanning bucket '%s' (account %s)...", state.bucket_name, state.account.account_id[:8])
+            scan_start = time.monotonic()
             scanned_count = 0
             for f in _iter_file_versions(state.bucket):
                 state.used_bytes += f.size
@@ -196,10 +198,12 @@ class B2AccountPool:
                 versions_per_file[f.file_name].append(f)
                 scanned_count += 1
                 if scanned_count % 1000 == 0:
-                    log.info("  Scanned %d files...", scanned_count)
+                    elapsed = time.monotonic() - scan_start
+                    log.info("  Scanned %d files... (%.1fs)", scanned_count, elapsed)
 
-            log.info("  Done: %d files (%.1fMB) in '%s'",
-                     scanned_count, state.used_bytes / 1024 / 1024, state.bucket_name)
+            elapsed = time.monotonic() - scan_start
+            log.info("  Done: %d files (%.1fMB) in '%s' (%.1fs)",
+                     scanned_count, state.used_bytes / 1024 / 1024, state.bucket_name, elapsed)
 
             # Check for multiple versions within this account (non-hide only)
             for name, versions in versions_per_file.items():
