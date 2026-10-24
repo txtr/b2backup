@@ -51,7 +51,7 @@ b2backup/
     ├── __init__.py         # Version
     ├── config.py           # YAML loading → Account dataclasses
     ├── storage.py          # B2AccountPool: cache, routing, mutations
-    └── cli.py              # Click commands: backup, restore, delete, ls, stats
+    └── cli.py              # Click commands: backup, restore, ls, stats
 ```
 
 ### Module Responsibilities
@@ -60,7 +60,7 @@ b2backup/
 |--------|----------------|----------------------|
 | `config.py` | Parse `accounts.yaml` | `Account`, `load_config()` |
 | `storage.py` | All B2 logic, cache, routing | `B2AccountPool`, `AccountState`, `BucketValidationError`, `ConsistencyError` |
-| `cli.py` | CLI UX, progress bars, output | `backup`, `restore`, `delete`, `ls`, `stats` |
+| `cli.py` | CLI UX, progress bars, output | `backup`, `restore`, `ls`, `stats` |
 
 ---
 
@@ -73,7 +73,6 @@ b2backup/
 │  Click command parser                                            │
 │  ├─ backup   → walk dir → upload_file() for each                │
 │  ├─ restore  → download_file()                                  │
-│  ├─ delete   → delete_file()                                    │
 │  ├─ ls       → list_files() (from cache)                        │
 │  └─ stats    → get_pool_stats() (from cache + live check)       │
 └────────────────────────────────┬────────────────────────────────┘
@@ -223,24 +222,7 @@ flowchart TD
 
 ---
 
-### 3. `b2backup delete "EFG/HIJ/file.ext"`
-
-```mermaid
-flowchart TD
-    A[pool.delete_file(name)] --> B[_cache.get(name)]
-    B --> C{Found?}
-    C -->|No| D[Raise FileNotFoundError]
-    C -->|Yes| E[state.bucket.get_file_info_by_name(name)]
-    E --> F[state.bucket.delete_file_version(file_id, name)]
-    F --> G[state.used_bytes -= file.size]
-    G --> H[state.file_count -= 1]
-    H --> I[del _cache[name]]
-    I --> J[Done]
-```
-
----
-
-### 4. `b2backup ls`
+### 3. `b2backup ls`
 
 ```mermaid
 flowchart TD
@@ -255,7 +237,7 @@ flowchart TD
 
 ---
 
-### 5. `b2backup stats`
+### 4. `b2backup stats`
 
 ```mermaid
 flowchart TD
@@ -401,9 +383,6 @@ b2backup --config=accounts.yaml stats
 
 # Restore a file
 b2backup --config=accounts.yaml restore "photos/2024/IMG_123.jpg" ./restored/
-
-# Delete a file
-b2backup --config=accounts.yaml delete "photos/2024/IMG_123.jpg"
 ```
 
 ### Filename Convention
