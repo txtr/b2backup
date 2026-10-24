@@ -101,6 +101,7 @@ def test_pool_initialization_builds_cache():
 
 def test_pool_detects_duplicate_at_startup():
     """Test that pool raises on duplicate filenames across accounts."""
+    from b2backup.storage import ConsistencyError
     account1, bucket1 = create_mock_account(
         "acc1", "bucket1",
         files=[MockFileVersion("same.txt", 100, 1000)]
@@ -115,12 +116,13 @@ def test_pool_detects_duplicate_at_startup():
         mock_api_class.return_value = mock_api
         mock_api.list_buckets.side_effect = [[bucket1], [bucket2]]
 
-        with pytest.raises(RuntimeError, match="CONSISTENCY VIOLATION"):
+        with pytest.raises(ConsistencyError, match="duplicate filenames across accounts"):
             B2AccountPool([account1, account2])
 
 
-def test_pool_skips_accounts_with_wrong_bucket_count():
-    """Test that accounts with !=1 bucket are skipped with warning."""
+def test_pool_rejects_accounts_with_wrong_bucket_count():
+    """Test that accounts with !=1 bucket cause hard failure."""
+    from b2backup.storage import BucketValidationError
     account1, bucket1 = create_mock_account(
         "acc1", "bucket1",
         files=[MockFileVersion("file1.txt", 100, 1000)]
@@ -133,12 +135,8 @@ def test_pool_skips_accounts_with_wrong_bucket_count():
         mock_api_class.return_value = mock_api
         mock_api.list_buckets.side_effect = [[bucket1], []]  # account2 has 0 buckets
 
-        with patch("b2backup.storage.log") as mock_log:
-            pool = B2AccountPool([account1, account2])
-            mock_log.warning.assert_called()
-
-    assert len(pool._states) == 1
-    assert len(pool._cache) == 1
+        with pytest.raises(BucketValidationError, match="0 buckets"):
+            B2AccountPool([account1, account2])
 
 
 def test_pick_account_best_fit():

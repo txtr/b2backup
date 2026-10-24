@@ -6,12 +6,12 @@ A minimal, single-process CLI tool for backing up directories to a pool of Backb
 
 | Principle | Decision |
 |-----------|----------|
-| **Simplicity over features** | ~300 LOC total; no daemon, no HTTP, no job queue |
+| **Simplicity over features** | ~450 LOC total; no daemon, no HTTP, no job queue |
 | **Trust the user** | No auth, no rate limits, no CSRF, no CSP |
 | **B2 as source of truth** | Startup scan validates consistency; cache updated on mutations |
 | **Atomic upserts** | Replacements always go to a *different* account; old version deleted after |
 | **Best-fit placement** | Pack files into accounts with least remaining space (bin-packing) |
-| **Graceful degradation** | Skip accounts with ≠1 bucket; log and continue |
+| **Strict validation** | Hard stop on any inconsistency (bucket count, versions, duplicates) |
 | **Observable** | Structured logging; `stats` command shows capacity per account |
 
 ---
@@ -22,7 +22,7 @@ A minimal, single-process CLI tool for backing up directories to a pool of Backb
 - **1700 files per bucket** (hard limit for `list_files` / `ls`)
 - **Per-application-key bucket access**: Each key must list exactly one bucket
 - **No native multi-bucket per key**: Workaround = multiple keys/accounts
-- **Hidden versions count against limits**: We count only latest (`latest_only=True`)
+- **All versions count against limits**: Hidden versions consume file slots and bytes
 - **Eventual consistency**: `list_buckets` / `ls` may lag seconds after mutations
 
 ### Operational Constraints
@@ -51,7 +51,7 @@ b2backup/
     ├── __init__.py         # Version
     ├── config.py           # YAML loading → Account dataclasses
     ├── storage.py          # B2AccountPool: cache, routing, mutations
-    └── cli.py              # Click commands: backup, restore, delete, list, stats
+    └── cli.py              # Click commands: backup, restore, delete, ls, stats
 ```
 
 ### Module Responsibilities
@@ -59,8 +59,8 @@ b2backup/
 | Module | Responsibility | Key Classes/Functions |
 |--------|----------------|----------------------|
 | `config.py` | Parse `accounts.yaml` | `Account`, `load_config()` |
-| `storage.py` | All B2 logic, cache, routing | `B2AccountPool`, `AccountState` |
-| `cli.py` | CLI UX, progress bars, output | `backup`, `restore`, `delete`, `list`, `stats` |
+| `storage.py` | All B2 logic, cache, routing | `B2AccountPool`, `AccountState`, `BucketValidationError`, `ConsistencyError` |
+| `cli.py` | CLI UX, progress bars, output | `backup`, `restore`, `delete`, `ls`, `stats` |
 
 ---
 
@@ -74,7 +74,7 @@ b2backup/
 │  ├─ backup   → walk dir → upload_file() for each                │
 │  ├─ restore  → download_file()                                  │
 │  ├─ delete   → delete_file()                                    │
-│  ├─ list     → list_files() (from cache)                        │
+│  ├─ ls       → list_files() (from cache)                        │
 │  └─ stats    → get_pool_stats() (from cache + live check)       │
 └────────────────────────────────┬────────────────────────────────┘
                                  │
@@ -82,13 +82,16 @@ b2backup/
 ┌─────────────────────────────────────────────────────────────────┐
 │                      B2AccountPool                               │
 ├─────────────────────────────────────────────────────────────────┤
-│  Startup:                                                        │
+│  Startup (strict validation - no mutations if inconsistent):    │
 │  1. Authorize each account_id/account_key                       │
-│  2. list_buckets() → must return exactly 1 bucket               │
-│  3. For each bucket: ls(latest_only=True)                       │
-│     - Build filename → AccountState cache                       │
-│     - Detect duplicates → abort on conflict                     │
-│     - Sum used_bytes, file_count per account                    │
+│  2. list_buckets() → MUST return exactly 1 bucket per account   │
+│  3. For each bucket: ls(latest_only=False)                      │
+│     - Sum used_bytes, file_count (ALL versions)                 │
+│     - Detect multiple versions per filename in same account     │
+│     - Pick latest version per filename for cross-account cache  │
+│  4. Cross-account duplicate check on latest versions            │
+│  5. If ANY violation: print detailed report → exit (1 or 2)     │
+│  6. Log pool summary                                             │
 │                                                                  │
 │  Runtime:                                                        │
 │  - _pick_account(size, exclude) → best-fit eligible account     │
@@ -124,19 +127,18 @@ class AccountState:
     account: Account
     bucket_name: str
     bucket: Bucket           # b2sdk Bucket handle
-    used_bytes: int = 0      # Sum of latest version sizes
-    file_count: int = 0      # Count of latest versions
-    max_files: int = 1700    # B2 hard limit
+    used_bytes: int = 0      # Sum of ALL version sizes (for capacity)
+    file_count: int = 0      # Count of ALL versions (for 1700 limit)
 ```
 
 ### Cache
 ```python
 # In B2AccountPool:
-_cache: dict[str, AccountState]   # filename → owning AccountState
+_cache: dict[str, AccountState]   # filename (latest) → owning AccountState
 _states: list[AccountState]       # All valid accounts
 ```
 
-**Invariant**: `name in _cache` ⟺ file exists in exactly one account's latest versions.
+**Invariant**: `name in _cache` ⟺ file's LATEST version exists in exactly one account.
 
 ---
 
@@ -277,16 +279,26 @@ sequenceDiagram
     B2-->>Pool: Auth tokens
     Pool->>B2: list_buckets() × N
     B2-->>Pool: Bucket list per account
-    Pool->>Pool: Filter: keep only len(buckets)==1
-    Pool->>B2: bucket.ls(latest_only=True) × valid_accounts
-    B2-->>Pool: File listings
-    Pool->>Pool: Build _cache, detect duplicates
-    alt Duplicate found
-        Pool->>User: RuntimeError: CONSISTENCY VIOLATION
-    else Clean
-        Pool->>Pool: Compute used_bytes, file_count per account
-        Pool->>User: Log pool summary
-        CLI->>Pool: backup() → upload_file() × M files
+    Pool->>Pool: Validate: each account MUST have exactly 1 bucket
+    alt Bucket count violation
+        Pool->>User: Print offender table → exit 1
+    else All valid
+        Pool->>B2: bucket.ls(latest_only=False) × N
+        B2-->>Pool: All file versions
+        Pool->>Pool: Aggregate used_bytes, file_count (all versions)
+        Pool->>Pool: Detect intra-account multiple versions
+        alt Multiple versions found
+            Pool->>User: Print per-account breakdown → exit 2
+        else Clean
+            Pool->>Pool: Pick latest per filename for cache
+            Pool->>Pool: Cross-account duplicate check (latest only)
+            alt Cross-account duplicates found
+                Pool->>User: Print filename → accounts → exit 2
+            else Consistent
+                Pool->>User: Log pool summary
+                CLI->>Pool: backup() → upload_file() × M files
+            end
+        end
     end
 ```
 
@@ -298,11 +310,11 @@ sequenceDiagram
 Goal: Pack files tightly, leave large contiguous gaps for future large files.
 
 For each account with capacity_in_mb set:
-    remaining_bytes = capacity_mb * 1024^2 - used_bytes
+    remaining_bytes = capacity_mb * 1024^2 - used_bytes (ALL versions)
 For unlimited accounts:
     remaining_bytes = ∞ (sorted last)
 
-remaining_files = 1700 - file_count  (B2 hard limit)
+remaining_files = 1700 - file_count (ALL versions count)
 
 Eligible iff:
     remaining_bytes >= file_size (or unlimited)
@@ -321,14 +333,19 @@ Tie-break: account_id (lexicographic, deterministic)
 
 | Scenario | Guarantee |
 |----------|-----------|
-| **Startup** | Aborts if any filename exists in ≥2 accounts (run `b2router-reconcile --apply` first) |
+| **Startup: bucket count** | Hard stop if any account has ≠1 bucket; prints offender table |
+| **Startup: intra-account versions** | Hard stop if any file has >1 version in same account; prints breakdown |
+| **Startup: cross-account duplicates** | Hard stop if same filename (latest) in ≥2 accounts; prints conflict |
 | **New file** | Written to exactly one account; cache updated atomically in-process |
 | **Replace file** | New version written to *different* account; old deleted after; cache points to new |
 | **Delete** | Removed from owning account; cache entry removed |
-| **Crash mid-upload** | Partial upload leaves no cache entry; B2 may have orphan object (cleaned on next reconcile) |
-| **Crash mid-replace** | New version in account B, old in account A → duplicate at next startup (caught by consistency check) |
+| **Crash mid-upload** | Partial upload leaves no cache entry; B2 may have orphan object |
+| **Crash mid-replace** | New version in account B, old in account A → duplicate at next startup (caught) |
 
-**Recovery**: If startup fails on duplicate, run `b2router-reconcile --apply` (from b2router repo) to keep newest copy per name.
+**Recovery**: If startup fails, manually resolve in B2 console:
+- Bucket count: Restrict key to exactly one bucket
+- Multiple versions: Delete old versions via B2 console/CLI
+- Cross-account duplicates: Delete from all but one account
 
 ---
 
@@ -429,6 +446,7 @@ Test coverage targets:
 - Cache consistency (duplicates, updates on mutate)
 - CLI argument parsing and path handling
 - Error paths (missing file, no space, no eligible account)
+- Startup validation (bucket count, intra-versions, cross-duplicates)
 
 ---
 
@@ -455,7 +473,9 @@ Monitor `stats` output:
 |---------|----------|
 | Config lost | Recreate from B2: `list_buckets` → get keys → rebuild YAML |
 | Cache corrupted | Delete nothing; restart rebuilds from B2 |
-| Duplicate at startup | `b2router-reconcile --apply` (external tool) |
+| Bucket count violation | Fix key restriction in B2 console; restart |
+| Multiple versions | Delete old versions in B2 console/CLI; restart |
+| Cross-account duplicates | Delete from all but one account; restart |
 | Account key revoked | Remove from config; re-backup affected files |
 
 ---
@@ -470,9 +490,9 @@ Monitor `stats` output:
 | Upserts | Async jobs, polling | Synchronous |
 | Replacements | Atomic, rollback on failure | Best-effort delete old |
 | Metrics | Prometheus `/metrics` | `stats` command |
-| Reconciliation | Built-in CLI | External (`b2router-reconcile`) |
+| Reconciliation | Built-in CLI | Manual (B2 console) |
 | Locking | `flock` single-writer | None (assume single user) |
-| Code size | ~3000 LOC | ~300 LOC |
+| Code size | ~3000 LOC | ~450 LOC |
 
 ---
 

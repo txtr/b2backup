@@ -1,11 +1,10 @@
 """CLI commands for b2backup."""
-import os
 import sys
 from pathlib import Path
 import click
 from tqdm import tqdm
 from .config import load_config
-from .storage import B2AccountPool
+from .storage import B2AccountPool, BucketValidationError, ConsistencyError
 
 
 def _get_pool(ctx):
@@ -14,7 +13,14 @@ def _get_pool(ctx):
         config = ctx.obj.get("config")
         if not config:
             raise click.UsageError("Missing --config")
-        ctx.obj["pool"] = B2AccountPool(load_config(str(config)))
+        try:
+            ctx.obj["pool"] = B2AccountPool(load_config(str(config)))
+        except BucketValidationError as e:
+            click.echo(str(e), err=True)
+            sys.exit(1)
+        except ConsistencyError as e:
+            click.echo(str(e), err=True)
+            sys.exit(2)
     return ctx.obj["pool"]
 
 

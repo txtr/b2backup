@@ -1,6 +1,8 @@
 """Core B2 storage logic: account pool, cache, routing, and mutations."""
 import itertools
 import logging
+import sys
+from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -11,6 +13,34 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 log = logging.getLogger(__name__)
 
 B2_MAX_FILES_PER_ACCOUNT = 1700
+
+
+class BucketValidationError(Exception):
+    """Raised when an account has != 1 bucket."""
+    def __init__(self, issues: list[tuple[Account, int, list[str]]]):
+        self.issues = issues  # (account, bucket_count, bucket_names)
+        super().__init__(self._format_message())
+
+    def _format_message(self) -> str:
+        lines = ["ERROR: Account validation failed"]
+        for acc, count, names in self.issues:
+            bucket_list = ", ".join(names) if names else "(none)"
+            lines.append(f"  {acc.account_id}: {count} buckets (expected 1) - {bucket_list}")
+        lines.append("Hint: Each application key must be restricted to exactly one bucket in B2 console.")
+        return "\n".join(lines)
+
+
+class ConsistencyError(Exception):
+    """Raised when consistency checks fail."""
+    def __init__(self, message: str, details: list[str]):
+        self.message = message
+        self.details = details
+        super().__init__(self._format_message())
+
+    def _format_message(self) -> str:
+        lines = [f"ERROR: {self.message}"]
+        lines.extend(f"  {d}" for d in self.details)
+        return "\n".join(lines)
 
 
 @dataclass
@@ -26,37 +56,46 @@ class AccountState:
 class B2AccountPool:
     """Manages a pool of B2 accounts with unified file namespace.
 
-    Startup:
+    Startup (strict validation, no mutations allowed if inconsistent):
         1. Authorize each account
-        2. Discover bucket (must be exactly one per account)
-        3. Scan all buckets (latest_only=True) to build cache
-        4. Validate no duplicate filenames across accounts
-        5. Compute used_bytes and file_count per account
+        2. Discover buckets - MUST be exactly one per account
+        3. Scan all buckets (latest_only=False) to:
+           - Compute true used_bytes/file_count (all versions count)
+           - Detect multiple versions of same file within account
+           - Build latest-version cache for cross-account duplicate detection
+        4. Validate no duplicate filenames across accounts (latest only)
+        5. Log pool summary
 
-    Invariants:
-        - _cache[name] = owning AccountState for every file in latest versions
+    Invariants (enforced at startup, maintained on mutations):
+        - _cache[name] = owning AccountState for every file's LATEST version
         - No filename exists in more than one account's latest versions
-        - used_bytes/file_count reflect latest versions only
+        - used_bytes/file_count reflect ALL versions (for capacity tracking)
     """
 
     def __init__(self, accounts: list[Account]):
         self._states: list[AccountState] = []
-        self._cache: dict[str, AccountState] = {}  # filename -> owning AccountState
+        self._cache: dict[str, AccountState] = {}  # filename -> owning AccountState (latest)
         self._cycle = itertools.cycle(range(len(accounts)))
 
         # Phase 1: Authorize and discover buckets
+        account_buckets: list[tuple[Account, list[Bucket]]] = []
         for acc in accounts:
             api = B2Api(InMemoryAccountInfo())
             api.authorize_account("production", acc.account_id, acc.account_key)
-
             buckets = api.list_buckets()
-            if len(buckets) != 1:
-                log.warning(
-                    "Skipping account %s: must expose exactly one bucket (found %d).",
-                    acc.account_id, len(buckets)
-                )
-                continue
+            account_buckets.append((acc, buckets))
 
+        # Phase 2: Validate bucket counts (must be exactly 1)
+        bucket_issues = []
+        for acc, buckets in account_buckets:
+            if len(buckets) != 1:
+                bucket_issues.append((acc, len(buckets), [b.name for b in buckets]))
+
+        if bucket_issues:
+            raise BucketValidationError(bucket_issues)
+
+        # All accounts valid - create states
+        for acc, buckets in account_buckets:
             bucket = buckets[0]
             state = AccountState(
                 account=acc,
@@ -65,11 +104,8 @@ class B2AccountPool:
             )
             self._states.append(state)
 
-        if not self._states:
-            raise RuntimeError("No valid accounts with exactly one bucket found")
-
-        # Phase 2: Build cache + validate consistency + compute usage
-        self._build_cache()
+        # Phase 3: Build cache + validate consistency + compute usage
+        self._build_cache_and_validate()
 
         log.info("Pool ready: %d accounts, %d unique files", len(self._states), len(self._cache))
         for s in self._states:
@@ -83,26 +119,67 @@ class B2AccountPool:
                 cap_str, rem_files
             )
 
-    def _build_cache(self) -> None:
-        """Scan all buckets, detect duplicates, compute usage."""
+    def _build_cache_and_validate(self) -> None:
+        """Scan all buckets (all versions), validate consistency, compute usage."""
+        cross_duplicates: dict[str, list[AccountState]] = defaultdict(list)
+        intra_duplicates: dict[str, dict[str, list]] = defaultdict(dict)  # account_id -> filename -> versions
+
         for state in self._states:
-            for f in state.bucket.ls(latest_only=True):
-                name = f.file_name
-                size = f.size
+            versions_per_file: dict[str, list] = defaultdict(list)
 
-                # Track usage
-                state.used_bytes += size
+            # Scan ALL versions for true capacity tracking
+            for f in state.bucket.ls(latest_only=False):
+                state.used_bytes += f.size
                 state.file_count += 1
+                versions_per_file[f.file_name].append(f)
 
-                # Check duplicate across accounts
+            # Check for multiple versions within this account
+            for name, versions in versions_per_file.items():
+                if len(versions) > 1:
+                    # Store for error reporting
+                    if state.account.account_id not in intra_duplicates:
+                        intra_duplicates[state.account.account_id] = {}
+                    intra_duplicates[state.account.account_id][name] = versions
+
+                # Pick latest for cache
+                latest = max(versions, key=lambda v: v.upload_timestamp)
                 if name in self._cache:
-                    other = self._cache[name]
-                    raise RuntimeError(
-                        f"CONSISTENCY VIOLATION: '{name}' exists in both "
-                        f"'{other.bucket_name}' and '{state.bucket_name}'. "
-                        f"Run b2router-reconcile --apply first."
+                    cross_duplicates[name].append(state)
+                else:
+                    self._cache[name] = state
+
+        # Phase 4: Report intra-account multiple versions
+        if intra_duplicates:
+            details = []
+            for acc_id, files in intra_duplicates.items():
+                bucket_name = next(s.bucket_name for s in self._states if s.account.account_id == acc_id)
+                details.append(f"Account {acc_id} ({bucket_name}):")
+                for name, versions in files.items():
+                    total_size = sum(v.size for v in versions)
+                    details.append(
+                        f"    {name} has {len(versions)} versions "
+                        f"(occupying {total_size / 1024 / 1024:.1f}MB, {len(versions)} slots)"
                     )
-                self._cache[name] = state
+            details.append("Hint: Delete old versions manually in B2 console or via B2 CLI.")
+            raise ConsistencyError(
+                "Consistency check failed - multiple versions in single account",
+                details
+            )
+
+        # Phase 5: Report cross-account duplicate filenames (latest only)
+        if cross_duplicates:
+            details = []
+            for name, states in cross_duplicates.items():
+                details.append(f"{name} exists in:")
+                for s in states:
+                    latest = s.bucket.get_file_info_by_name(name)
+                    ts = latest.upload_timestamp
+                    details.append(f"  - {s.account.account_id[:8]} ({s.bucket_name}) [latest: {ts}]")
+            details.append("Hint: Delete duplicate from all but one account manually.")
+            raise ConsistencyError(
+                "Consistency check failed - duplicate filenames across accounts",
+                details
+            )
 
     def _remaining_bytes(self, state: AccountState) -> Optional[int]:
         """Bytes remaining in this account's soft capacity budget."""
