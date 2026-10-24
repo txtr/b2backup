@@ -10,6 +10,8 @@ from typing import Optional
 from b2sdk.v2 import B2Api, InMemoryAccountInfo, Bucket
 from .config import Account, Config
 
+UNLIMITED_REMAINING = 10**18
+
 _LOG_LEVEL = os.environ.get("B2BACKUP_LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
     level=getattr(logging, _LOG_LEVEL, logging.INFO),
@@ -199,11 +201,12 @@ class B2AccountPool:
                     results.append(future.result())
                 except Exception as e:
                     acc = future_to_acc[future]
-                    errors.append(f"Account {acc.account_id}: {e}")
+                    errors.append(f"Account {acc.account_id}: {type(e).__name__}: {e}")
         
         if errors:
-            raise BucketValidationError(
-                [(None, 0, ["Authorization failed for some accounts:"] + errors)]
+            raise ParallelOperationError(
+                "Authorization failed for some accounts",
+                errors
             )
         return results
 
@@ -234,11 +237,12 @@ class B2AccountPool:
                         issues.append(result)
                 except Exception as e:
                     acc = futures[future]
-                    errors.append(f"Account {acc.account_id}: {e}")
+                    errors.append(f"Account {acc.account_id}: {type(e).__name__}: {e}")
         
         if errors:
-            raise HideMarkerError(
-                [("error", "error", errors)]
+            raise ParallelOperationError(
+                "Hide marker check failed for some accounts",
+                errors
             )
         return issues
 
@@ -285,10 +289,10 @@ class B2AccountPool:
                     scan_results.append(future.result())
                 except Exception as e:
                     state = futures[future]
-                    scan_errors.append(f"Account {state.account.account_id}: {e}")
+                    scan_errors.append(f"Account {state.account.account_id}: {type(e).__name__}: {e}")
         
         if scan_errors:
-            raise ConsistencyError(
+            raise ParallelOperationError(
                 "Scan failed for some accounts",
                 scan_errors
             )
@@ -391,7 +395,7 @@ class B2AccountPool:
 
         def remaining_after(s: AccountState) -> int:
             rem = self._remaining_bytes(s)
-            return (rem - file_size) if rem is not None else 10**18
+            return (rem - file_size) if rem is not None else UNLIMITED_REMAINING
 
         return sorted(eligible, key=lambda s: (remaining_after(s), s.account.account_id))
 
