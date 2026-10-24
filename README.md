@@ -148,19 +148,16 @@ _states: list[AccountState]       # All valid accounts
 
 ### 1. `b2backup backup /path/to/dir`
 
-```mermaid
-flowchart TD
-    A[Resolve source path] --> B[root_name = source.name]
-    B --> C[Walk source.rglob *]
-    C --> D[Filter is_file]
-    D --> E{Any files?}
-    E -->|No| F[Print "No files"; exit 0]
-    E -->|Yes| G[For each file with tqdm]
-    G --> H[rel = file.relative_to source.parent]
-    H --> I[pool.upload_file str(rel), file]
-    I --> J[Next file]
-    J --> G
-    G --> K[Print "Backup complete"]
+```
+1. Resolve source path
+2. root_name = source.name (e.g., /ABC/CDE/EFG -> "EFG")
+3. Walk source.rglob("*")
+4. Filter is_file()
+5. If no files: print "No files"; exit 0
+6. For each file (with tqdm progress bar):
+     rel = file.relative_to(source.parent)  # EFG/HIJ/KLM/file.ext
+     pool.upload_file(str(rel), file)
+7. Print "Backup complete"
 ```
 
 **`pool.upload_file(name, local_path)`**:
@@ -209,28 +206,27 @@ Tie-break: account_id (deterministic)
 
 ### 2. `b2backup restore "EFG/HIJ/file.ext" ./dest/`
 
-```mermaid
-flowchart TD
-    A[pool.download_file name, dest_path] --> B[_cache.get name]
-    B --> C{Found?}
-    C -->|No| D[Raise FileNotFoundError]
-    C -->|Yes| E[state.bucket.get_file_info_by_name name]
-    E --> F[state.bucket.download_file_by_id file_id]
-    F --> G[dest_path.write_bytes content]
-    G --> H[Done]
+```
+1. pool.download_file(name, dest_path)
+2. _cache.get(name)
+3. If not found: raise FileNotFoundError
+4. state.bucket.get_file_info_by_name(name)
+5. state.bucket.download_file_by_id(file_id)
+6. dest_path.write_bytes(content)
+7. Done
 ```
 
 ---
 
 ### 3. `b2backup ls`
 
-```mermaid
-flowchart TD
-    A[pool.list_files] --> B[For each name, state in sorted _cache]
-    B --> C[file_obj = state.bucket.get_file_info_by_name name]
-    C --> D[Collect: name, size, timestamp, content_type, account_id]
-    D --> E[Return list dict]
-    E --> F[CLI prints formatted table]
+```
+1. pool.list_files()
+2. For each name, state in sorted(_cache):
+     file_obj = state.bucket.get_file_info_by_name(name)
+     Collect: name, size, timestamp, content_type, account_id
+3. Return list of dicts
+4. CLI prints formatted table
 ```
 
 > **Note**: `list_files()` does a live `get_file_info_by_name` per file to get fresh metadata. For large pools, consider caching metadata at startup (trade memory for speed).
@@ -239,52 +235,35 @@ flowchart TD
 
 ### 4. `b2backup stats`
 
-```mermaid
-flowchart TD
-    A[pool.get_pool_stats] --> B[Aggregate totals from _states]
-    B --> C[For each state: compute remaining_bytes, remaining_files]
-    C --> D[Return dict with totals + per-account breakdown]
-    D --> E[CLI prints formatted table]
+```
+1. pool.get_pool_stats()
+2. Aggregate totals from _states
+3. For each state: compute remaining_bytes, remaining_files
+4. Return dict with totals + per-account breakdown
+5. CLI prints formatted table
 ```
 
 ---
 
 ## Startup Sequence (Critical Path)
 
-```mermaid
-sequenceDiagram
-    participant User
-    participant CLI
-    participant Pool
-    participant B2
-
-    User->>CLI: b2backup --config=accounts.yaml backup /data
-    CLI->>Pool: B2AccountPool accounts
-    Pool->>B2: authorize_account × N accounts
-    B2-->>Pool: Auth tokens
-    Pool->>B2: list_buckets × N
-    B2-->>Pool: Bucket list per account
-    Pool->>Pool: CHECK 1: Each account MUST have exactly 1 bucket
-    alt CHECK 1 FAILS (≠1 bucket)
-        Pool->>User: Print offender table → exit 1
-    else CHECK 1 PASSES
-        Pool->>B2: bucket.ls latest_only=False × N
-        B2-->>Pool: All file versions
-        Pool->>Pool: Aggregate used_bytes, file_count ALL versions
-        Pool->>Pool: CHECK 2: No file has >1 version in same account
-        alt CHECK 2 FAILS intra-account versions
-            Pool->>User: Print per-account breakdown → exit 2
-        else CHECK 2 PASSES
-            Pool->>Pool: Pick latest per filename for cross-account check
-            Pool->>Pool: CHECK 3: No filename latest in ≥2 accounts
-            alt CHECK 3 FAILS cross-account duplicates
-                Pool->>User: Print conflicts with timestamps → exit 2
-            else ALL CHECKS PASS
-                Pool->>User: Log pool summary
-                CLI->>Pool: backup → upload_file × M files
-            end
-        end
-    end
+```
+1. User runs: b2backup --config=accounts.yaml backup /data
+2. CLI creates B2AccountPool(accounts)
+3. Pool authorizes each account (× N)
+4. Pool calls list_buckets() for each account (× N)
+5. CHECK 1: Each account MUST have exactly 1 bucket
+   - If FAIL: Print offender table → exit 1
+6. Pool calls bucket.ls(latest_only=False) for each bucket (× N)
+7. Aggregate used_bytes, file_count (ALL versions)
+8. CHECK 2: No file has >1 version in same account
+   - If FAIL: Print per-account breakdown → exit 2
+9. Pick latest per filename for cross-account check
+10. CHECK 3: No filename (latest) in ≥2 accounts
+    - If FAIL: Print conflicts with timestamps → exit 2
+11. If ALL CHECKS PASS:
+     - Log pool summary
+     - Run backup() → upload_file() × M files
 ```
 
 ---
