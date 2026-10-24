@@ -8,12 +8,13 @@ from b2backup.storage import B2AccountPool
 
 
 class MockFileVersion:
-    def __init__(self, file_name, size, upload_timestamp, content_type="application/octet-stream", id_="file_id_123"):
+    def __init__(self, file_name, size, upload_timestamp, content_type="application/octet-stream", id_="file_id_123", action="upload"):
         self.file_name = file_name
         self.size = size
         self.upload_timestamp = upload_timestamp
         self.content_type = content_type
         self.id_ = id_
+        self.action = action
 
 
 class MockBucket:
@@ -216,10 +217,12 @@ def test_pool_initialization_builds_cache():
 def test_pool_scans_all_versions_recursively():
     """Test that startup lists all versions recursively and handles b2sdk tuples."""
     account1, bucket1 = create_mock_account("acc1", "bucket1")
-    bucket1.ls = Mock(return_value=[
+    # ls is called twice: once for hide marker check, once for cache building
+    ls_return = [
         (MockFileVersion("nested/file.txt", 100, 1000), None),
         (MockFileVersion("folder", 0, 900), "folder/"),  # synthesized folder marker
-    ])
+    ]
+    bucket1.ls = Mock(return_value=ls_return)
 
     with patch("b2backup.storage.B2Api") as mock_api_class:
         mock_api = Mock()
@@ -228,7 +231,8 @@ def test_pool_scans_all_versions_recursively():
 
         pool = B2AccountPool([account1], 1700)
 
-    bucket1.ls.assert_called_once_with(latest_only=False, recursive=True)
+    assert bucket1.ls.call_count == 2
+    bucket1.ls.assert_called_with(latest_only=False, recursive=True)
     assert pool._cache["nested/file.txt"] == pool._states[0]
     assert "folder" not in pool._cache
     assert pool._states[0].used_bytes == 100
@@ -281,6 +285,51 @@ def test_duplicate_report_includes_all_owners_and_timestamps():
     assert "acc2" in message
     assert "latest: 1000" in message
     assert "latest: 2000" in message
+
+
+def test_pool_rejects_hide_markers():
+    """Test that pool raises on hide markers (deleted files with versions)."""
+    from b2backup.storage import HideMarkerError
+    account1, bucket1 = create_mock_account(
+        "acc1", "bucket1",
+        files=[
+            MockFileVersion("active.txt", 100, 1000, action="upload"),
+            MockFileVersion("deleted.txt", 0, 2000, action="hide"),  # hide marker
+        ]
+    )
+
+    with patch("b2backup.storage.B2Api") as mock_api_class:
+        mock_api = Mock()
+        mock_api_class.return_value = mock_api
+        mock_api.list_buckets.return_value = [bucket1]
+
+        with pytest.raises(HideMarkerError) as excinfo:
+            B2AccountPool([account1], 1700)
+
+    message = str(excinfo.value)
+    assert "acc1" in message
+    assert "deleted.txt" in message
+    assert "hide markers" in message
+
+
+def test_pool_allows_start_markers():
+    """Test that start markers (incomplete uploads) don't trigger hide marker error."""
+    account1, bucket1 = create_mock_account(
+        "acc1", "bucket1",
+        files=[
+            MockFileVersion("active.txt", 100, 1000, action="upload"),
+            MockFileVersion("incomplete.txt", 0, 2000, action="start"),  # start marker
+        ]
+    )
+
+    with patch("b2backup.storage.B2Api") as mock_api_class:
+        mock_api = Mock()
+        mock_api_class.return_value = mock_api
+        mock_api.list_buckets.return_value = [bucket1]
+
+        # Should not raise HideMarkerError
+        pool = B2AccountPool([account1], 1700)
+        assert pool is not None
 
 
 def test_pool_rejects_accounts_with_wrong_bucket_count():

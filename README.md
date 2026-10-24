@@ -321,6 +321,7 @@ Tie-break: account_id (lexicographic, deterministic)
 - Bucket count: Remove or transfer extra buckets so the account has exactly one
 - Multiple versions: Delete old versions via B2 console/CLI
 - Cross-account duplicates: Delete from all but one account
+- Hide markers: Permanently delete old versions (including hide markers) via B2 console or `b2 delete-file-version`
 
 ---
 

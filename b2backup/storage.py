@@ -44,6 +44,26 @@ class ConsistencyError(Exception):
         return "\n".join(lines)
 
 
+class HideMarkerError(Exception):
+    """Raised when files with hide markers (deleted files) are detected."""
+    def __init__(self, issues: list[tuple[str, str, list[str]]]):
+        self.issues = issues  # (account_id, bucket_name, files_with_hide_markers)
+        super().__init__(self._format_message())
+
+    def _format_message(self) -> str:
+        lines = ["ERROR: Files with hide markers detected (deleted files still have versions)"]
+        for acc_id, bucket_name, files in self.issues:
+            lines.append(f"  {acc_id} ({bucket_name}): {len(files)} files with hide markers")
+            for f in files[:10]:  # Show first 10
+                lines.append(f"    {f}")
+            if len(files) > 10:
+                lines.append(f"    ... and {len(files) - 10} more")
+        lines.append("Hint: These files were deleted but hidden versions remain.")
+        lines.append("      Use B2 console or CLI to permanently delete old versions.")
+        lines.append("      Or run 'b2 delete-file-version' for each hide marker.")
+        return "\n".join(lines)
+
+
 def _iter_file_versions(bucket: Bucket):
     """Yield every file version in a bucket, recursively.
 
@@ -77,12 +97,13 @@ class B2AccountPool:
     Startup (strict validation, no mutations allowed if inconsistent):
         1. Authorize each account
         2. Discover buckets - MUST be exactly one per account
-        3. Scan all buckets (latest_only=False) to:
+        3. Check for hide markers (deleted files with remaining versions)
+        4. Scan all buckets (latest_only=False) to:
            - Compute true used_bytes/file_count (all versions count)
            - Detect multiple versions of same file within account
            - Build latest-version cache for cross-account duplicate detection
-        4. Validate no duplicate filenames across accounts (latest only)
-        5. Log pool summary
+        5. Validate no duplicate filenames across accounts (latest only)
+        6. Log pool summary
 
     Invariants (enforced at startup, maintained on mutations):
         - _cache[name] = owning AccountState for every file's LATEST version
@@ -111,6 +132,25 @@ class B2AccountPool:
 
         if bucket_issues:
             raise BucketValidationError(bucket_issues)
+
+        # Phase 2.5: Check for hide markers (deleted files with remaining versions)
+        hide_marker_issues = []
+        for acc, buckets in account_buckets:
+            bucket = buckets[0]
+            files_with_hide = set()
+            # Quick scan for hide markers
+            for f in bucket.ls(latest_only=False, recursive=True):
+                if isinstance(f, tuple):
+                    fv = f[0]
+                else:
+                    fv = f
+                if getattr(fv, 'action', 'upload') == 'hide':
+                    files_with_hide.add(fv.file_name)
+            if files_with_hide:
+                hide_marker_issues.append((acc.account_id, bucket.name, sorted(files_with_hide)))
+
+        if hide_marker_issues:
+            raise HideMarkerError(hide_marker_issues)
 
         # All accounts valid - create states
         for acc, buckets in account_buckets:
@@ -161,23 +201,28 @@ class B2AccountPool:
             log.info("  Done: %d files (%.1fMB) in '%s'",
                      scanned_count, state.used_bytes / 1024 / 1024, state.bucket_name)
 
-            # Check for multiple versions within this account
+            # Check for multiple versions within this account (non-hide only)
             for name, versions in versions_per_file.items():
-                if len(versions) > 1:
-                    # Store for error reporting
+                # Filter out hide markers for version counting and cache
+                non_hide_versions = [v for v in versions if getattr(v, 'action', 'upload') != 'hide']
+
+                if len(non_hide_versions) > 1:
+                    # Store for error reporting (only non-hide versions)
                     if state.account.account_id not in intra_duplicates:
                         intra_duplicates[state.account.account_id] = {}
-                    intra_duplicates[state.account.account_id][name] = versions
+                    intra_duplicates[state.account.account_id][name] = non_hide_versions
 
-                # Pick latest for cache / cross-account comparison
-                latest = max(versions, key=lambda v: v.upload_timestamp)
-                if name in latest_versions:
-                    if name not in cross_duplicates:
-                        cross_duplicates[name].append(latest_versions[name])
-                    cross_duplicates[name].append((state, latest))
-                else:
-                    latest_versions[name] = (state, latest)
-                    self._cache[name] = state
+                # Pick latest NON-HIDE version for cache / cross-account comparison
+                if non_hide_versions:
+                    latest = max(non_hide_versions, key=lambda v: v.upload_timestamp)
+                    if name in latest_versions:
+                        if name not in cross_duplicates:
+                            cross_duplicates[name].append(latest_versions[name])
+                        cross_duplicates[name].append((state, latest))
+                    else:
+                        latest_versions[name] = (state, latest)
+                        self._cache[name] = state
+                # If only hide markers exist, file is deleted - don't cache it
 
         # Phase 4: Report intra-account multiple versions
         if intra_duplicates:
@@ -346,7 +391,11 @@ class B2AccountPool:
         """List all files with metadata (live B2 lookup for freshness)."""
         result = []
         for name, state in sorted(self._cache.items()):
-            file_obj = state.bucket.get_file_info_by_name(name)
+            try:
+                file_obj = state.bucket.get_file_info_by_name(name)
+            except Exception as e:
+                log.warning("File '%s' in cache but not in B2 (%s): %s", name, state.bucket_name, e)
+                continue
             result.append({
                 "name": name,
                 "size": file_obj.size,

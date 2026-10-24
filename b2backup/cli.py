@@ -5,7 +5,7 @@ from pathlib import Path
 import click
 from tqdm import tqdm
 from .config import load_config
-from .storage import B2AccountPool, BucketValidationError, ConsistencyError
+from .storage import B2AccountPool, BucketValidationError, ConsistencyError, HideMarkerError
 
 
 def _get_pool(ctx):
@@ -27,6 +27,9 @@ def _get_pool(ctx):
         except ConsistencyError as e:
             click.echo(str(e), err=True)
             sys.exit(2)
+        except HideMarkerError as e:
+            click.echo(str(e), err=True)
+            sys.exit(3)
     return ctx.obj["pool"]
 
 
