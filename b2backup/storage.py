@@ -166,102 +166,6 @@ class B2AccountPool:
                 cap_str, rem_files
             )
 
-        log.info("Pool ready: %d accounts, %d unique files", len(self._states), len(self._cache))
-        for s in self._states:
-            rem_bytes = self._remaining_bytes(s)
-            rem_files = self._remaining_files(s)
-            cap_str = f"{rem_bytes / 1024 / 1024:.0f}MB" if rem_bytes is not None else "unlimited"
-            log.info(
-                "  %s (%s): %d files, %.0fMB used, remaining: %s, %d slots",
-                s.account.account_id[:8], s.bucket_name,
-                s.file_count, s.used_bytes / 1024 / 1024,
-                cap_str, rem_files
-            )
-
-    def _build_cache_and_validate(self) -> None:
-        """Scan all buckets (all versions), validate consistency, compute usage."""
-        # name -> [(owning state, latest FileVersion), ...] for files seen in >1 account
-        cross_duplicates: dict[str, list[tuple[AccountState, object]]] = defaultdict(list)
-        latest_versions: dict[str, tuple[AccountState, object]] = {}
-        intra_duplicates: dict[str, dict[str, list]] = defaultdict(dict)  # account_id -> filename -> versions
-
-        for state in self._states:
-            versions_per_file: dict[str, list] = defaultdict(list)
-
-            # Scan ALL versions recursively for true capacity tracking
-            log.info("Scanning bucket '%s' (account %s)...", state.bucket_name, state.account.account_id[:8])
-            scan_start = time.monotonic()
-            scanned_count = 0
-            for f in _iter_file_versions(state.bucket):
-                state.used_bytes += f.size
-                state.file_count += 1
-                versions_per_file[f.file_name].append(f)
-                scanned_count += 1
-                if scanned_count % 1000 == 0:
-                    elapsed = time.monotonic() - scan_start
-                    log.info("  Scanned %d files... (%.1fs)", scanned_count, elapsed)
-
-            elapsed = time.monotonic() - scan_start
-            log.info("  Done: %d files (%.1fMB) in '%s' (%.1fs)",
-                     scanned_count, state.used_bytes / 1024 / 1024, state.bucket_name, elapsed)
-
-            # Check for multiple versions within this account (non-hide only)
-            for name, versions in versions_per_file.items():
-                # Filter out hide markers for version counting and cache
-                non_hide_versions = [v for v in versions if getattr(v, 'action', 'upload') != 'hide']
-
-                if len(non_hide_versions) > 1:
-                    # Store for error reporting (only non-hide versions)
-                    if state.account.account_id not in intra_duplicates:
-                        intra_duplicates[state.account.account_id] = {}
-                    intra_duplicates[state.account.account_id][name] = non_hide_versions
-
-                # Pick latest NON-HIDE version for cache / cross-account comparison
-                if non_hide_versions:
-                    latest = max(non_hide_versions, key=lambda v: v.upload_timestamp)
-                    if name in latest_versions:
-                        if name not in cross_duplicates:
-                            cross_duplicates[name].append(latest_versions[name])
-                        cross_duplicates[name].append((state, latest))
-                    else:
-                        latest_versions[name] = (state, latest)
-                        self._cache[name] = state
-                # If only hide markers exist, file is deleted - don't cache it
-
-        # Phase 4: Report intra-account multiple versions
-        if intra_duplicates:
-            details = []
-            for acc_id, files in intra_duplicates.items():
-                bucket_name = next(s.bucket_name for s in self._states if s.account.account_id == acc_id)
-                details.append(f"Account {acc_id} ({bucket_name}):")
-                for name, versions in files.items():
-                    total_size = sum(v.size for v in versions)
-                    details.append(
-                        f"    {name} has {len(versions)} versions "
-                        f"(occupying {total_size / 1024 / 1024:.1f}MB, {len(versions)} slots)"
-                    )
-            details.append("Hint: Delete old versions manually in B2 console or via B2 CLI.")
-            raise ConsistencyError(
-                "Consistency check failed - multiple versions in single account",
-                details
-            )
-
-        # Phase 5: Report cross-account duplicate filenames (latest only)
-        if cross_duplicates:
-            details = []
-            for name, entries in cross_duplicates.items():
-                details.append(f"{name} exists in:")
-                for state, latest in entries:
-                    details.append(
-                        f"  - {state.account.account_id[:8]} ({state.bucket_name}) "
-                        f"[latest: {latest.upload_timestamp}]"
-                    )
-            details.append("Hint: Delete duplicate from all but one account manually.")
-            raise ConsistencyError(
-                "Consistency check failed - duplicate filenames across accounts",
-                details
-            )
-
     # --- Parallel startup helpers ---
 
     def _authorize_account(self, acc: Account) -> tuple[Account, list[Bucket]]:
@@ -318,11 +222,12 @@ class B2AccountPool:
             scanned_count += 1
             if scanned_count % 1000 == 0:
                 elapsed = time.monotonic() - scan_start
-                log.info("  [%s] Scanned %d files... (%.1fs)", state.account.account_id[:8], scanned_count, elapsed)
+                log.info("  Scanning bucket '%s' (account %s)... %d files scanned (%.1fs)",
+                         state.bucket_name, state.account.account_id[:8], scanned_count, elapsed)
 
         elapsed = time.monotonic() - scan_start
-        log.info("  [%s] Done: %d files (%.1fMB) in '%s' (%.1fs)",
-                 state.account.account_id[:8], scanned_count, state.used_bytes / 1024 / 1024, state.bucket_name, elapsed)
+        log.info("  Done: %d files (%.1fMB) in '%s' (%.1fs)",
+                 scanned_count, state.used_bytes / 1024 / 1024, state.bucket_name, elapsed)
 
         return {
             "state": state,
