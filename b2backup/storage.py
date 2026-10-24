@@ -176,15 +176,25 @@ class B2AccountPool:
         return (acc, buckets)
 
     def _parallel_authorize(self, accounts: list[Account], max_workers: int) -> list[tuple[Account, list[Bucket]]]:
-        """Authorize all accounts in parallel."""
+        """Authorize all accounts in parallel, collecting all errors."""
         results = []
+        errors = []
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_acc = {executor.submit(self._authorize_account, acc): acc for acc in accounts}
             for future in as_completed(future_to_acc):
-                results.append(future.result())
+                try:
+                    results.append(future.result())
+                except Exception as e:
+                    acc = future_to_acc[future]
+                    errors.append(f"Account {acc.account_id}: {e}")
+        
+        if errors:
+            raise BucketValidationError(
+                [(None, 0, ["Authorization failed for some accounts:"] + errors)]
+            )
         return results
 
-    def _check_hide_markers(self, acc: Account, bucket: Bucket) -> tuple[str, str, list[str]] | None:
+    def _check_hide_markers(self, acc: Account, bucket: Bucket) -> Optional[tuple[str, str, list[str]]]:
         """Check single bucket for hide markers."""
         files_with_hide = set()
         for f in bucket.ls(latest_only=False, recursive=True):
@@ -199,14 +209,24 @@ class B2AccountPool:
         return None
 
     def _parallel_hide_check(self, account_buckets: list[tuple[Account, list[Bucket]]], max_workers: int) -> list:
-        """Check all buckets for hide markers in parallel."""
+        """Check all buckets for hide markers in parallel, collecting all errors."""
         issues = []
+        errors = []
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {executor.submit(self._check_hide_markers, acc, buckets[0]): acc for acc, buckets in account_buckets}
             for future in as_completed(futures):
-                result = future.result()
-                if result:
-                    issues.append(result)
+                try:
+                    result = future.result()
+                    if result:
+                        issues.append(result)
+                except Exception as e:
+                    acc = futures[future]
+                    errors.append(f"Account {acc.account_id}: {e}")
+        
+        if errors:
+            raise HideMarkerError(
+                [("error", "error", errors)]
+            )
         return issues
 
     def _scan_bucket(self, state: AccountState) -> dict:
@@ -243,9 +263,22 @@ class B2AccountPool:
         intra_duplicates: dict[str, dict[str, list]] = defaultdict(dict)
 
         # Parallel scan
+        scan_results = []
+        scan_errors = []
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {executor.submit(self._scan_bucket, state): state for state in self._states}
-            scan_results = [future.result() for future in as_completed(futures)]
+            for future in as_completed(futures):
+                try:
+                    scan_results.append(future.result())
+                except Exception as e:
+                    state = futures[future]
+                    scan_errors.append(f"Account {state.account.account_id}: {e}")
+        
+        if scan_errors:
+            raise ConsistencyError(
+                "Scan failed for some accounts",
+                scan_errors
+            )
 
         # Merge results and validate
         for result in scan_results:
