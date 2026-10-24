@@ -1,8 +1,9 @@
 """Core B2 storage logic: account pool, cache, routing, and mutations."""
 import logging
-import time
 import os
+import time
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -112,18 +113,16 @@ class B2AccountPool:
         - used_bytes/file_count reflect ALL versions (for capacity tracking)
     """
 
-    def __init__(self, accounts: list[Account], max_files_per_account: int = 1700):
+    def __init__(self, accounts: list[Account], max_files_per_account: int = 1700, max_workers: int = 10):
         self._states: list[AccountState] = []
         self._cache: dict[str, AccountState] = {}  # filename -> owning AccountState (latest)
         self._max_files_per_account = max_files_per_account
 
-        # Phase 1: Authorize and discover buckets
-        account_buckets: list[tuple[Account, list[Bucket]]] = []
-        for acc in accounts:
-            api = B2Api(InMemoryAccountInfo())
-            api.authorize_account("production", acc.account_id, acc.account_key)
-            buckets = api.list_buckets()
-            account_buckets.append((acc, buckets))
+        log.info("Authorizing %d accounts...", len(accounts))
+
+        # Phase 1: Parallel authorize and discover buckets
+        account_buckets = self._parallel_authorize(accounts, max_workers)
+        log.info("Discovered buckets for %d accounts", len(account_buckets))
 
         # Phase 2: Validate bucket counts (must be exactly 1)
         bucket_issues = []
@@ -134,21 +133,9 @@ class B2AccountPool:
         if bucket_issues:
             raise BucketValidationError(bucket_issues)
 
-        # Phase 2.5: Check for hide markers (deleted files with remaining versions)
-        hide_marker_issues = []
-        for acc, buckets in account_buckets:
-            bucket = buckets[0]
-            files_with_hide = set()
-            # Quick scan for hide markers
-            for f in bucket.ls(latest_only=False, recursive=True):
-                if isinstance(f, tuple):
-                    fv = f[0]
-                else:
-                    fv = f
-                if getattr(fv, 'action', 'upload') == 'hide':
-                    files_with_hide.add(fv.file_name)
-            if files_with_hide:
-                hide_marker_issues.append((acc.account_id, bucket.name, sorted(files_with_hide)))
+        # Phase 2.5: Parallel hide marker check
+        log.info("Checking for hide markers...")
+        hide_marker_issues = self._parallel_hide_check(account_buckets, max_workers)
 
         if hide_marker_issues:
             raise HideMarkerError(hide_marker_issues)
@@ -163,8 +150,21 @@ class B2AccountPool:
             )
             self._states.append(state)
 
-        # Phase 3: Build cache + validate consistency + compute usage
-        self._build_cache_and_validate()
+        # Phase 3: Parallel scan + build cache + validate consistency + compute usage
+        log.info("Scanning %d buckets...", len(self._states))
+        self._parallel_scan_and_validate(max_workers)
+
+        log.info("Pool ready: %d accounts, %d unique files", len(self._states), len(self._cache))
+        for s in self._states:
+            rem_bytes = self._remaining_bytes(s)
+            rem_files = self._remaining_files(s)
+            cap_str = f"{rem_bytes / 1024 / 1024:.0f}MB" if rem_bytes is not None else "unlimited"
+            log.info(
+                "  %s (%s): %d files, %.0fMB used, remaining: %s, %d slots",
+                s.account.account_id[:8], s.bucket_name,
+                s.file_count, s.used_bytes / 1024 / 1024,
+                cap_str, rem_files
+            )
 
         log.info("Pool ready: %d accounts, %d unique files", len(self._states), len(self._cache))
         for s in self._states:
@@ -227,6 +227,143 @@ class B2AccountPool:
                         latest_versions[name] = (state, latest)
                         self._cache[name] = state
                 # If only hide markers exist, file is deleted - don't cache it
+
+        # Phase 4: Report intra-account multiple versions
+        if intra_duplicates:
+            details = []
+            for acc_id, files in intra_duplicates.items():
+                bucket_name = next(s.bucket_name for s in self._states if s.account.account_id == acc_id)
+                details.append(f"Account {acc_id} ({bucket_name}):")
+                for name, versions in files.items():
+                    total_size = sum(v.size for v in versions)
+                    details.append(
+                        f"    {name} has {len(versions)} versions "
+                        f"(occupying {total_size / 1024 / 1024:.1f}MB, {len(versions)} slots)"
+                    )
+            details.append("Hint: Delete old versions manually in B2 console or via B2 CLI.")
+            raise ConsistencyError(
+                "Consistency check failed - multiple versions in single account",
+                details
+            )
+
+        # Phase 5: Report cross-account duplicate filenames (latest only)
+        if cross_duplicates:
+            details = []
+            for name, entries in cross_duplicates.items():
+                details.append(f"{name} exists in:")
+                for state, latest in entries:
+                    details.append(
+                        f"  - {state.account.account_id[:8]} ({state.bucket_name}) "
+                        f"[latest: {latest.upload_timestamp}]"
+                    )
+            details.append("Hint: Delete duplicate from all but one account manually.")
+            raise ConsistencyError(
+                "Consistency check failed - duplicate filenames across accounts",
+                details
+            )
+
+    # --- Parallel startup helpers ---
+
+    def _authorize_account(self, acc: Account) -> tuple[Account, list[Bucket]]:
+        """Authorize single account and list its buckets."""
+        api = B2Api(InMemoryAccountInfo())
+        api.authorize_account("production", acc.account_id, acc.account_key)
+        buckets = api.list_buckets()
+        return (acc, buckets)
+
+    def _parallel_authorize(self, accounts: list[Account], max_workers: int) -> list[tuple[Account, list[Bucket]]]:
+        """Authorize all accounts in parallel."""
+        results = []
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_acc = {executor.submit(self._authorize_account, acc): acc for acc in accounts}
+            for future in as_completed(future_to_acc):
+                results.append(future.result())
+        return results
+
+    def _check_hide_markers(self, acc: Account, bucket: Bucket) -> tuple[str, str, list[str]] | None:
+        """Check single bucket for hide markers."""
+        files_with_hide = set()
+        for f in bucket.ls(latest_only=False, recursive=True):
+            if isinstance(f, tuple):
+                fv = f[0]
+            else:
+                fv = f
+            if getattr(fv, 'action', 'upload') == 'hide':
+                files_with_hide.add(fv.file_name)
+        if files_with_hide:
+            return (acc.account_id, bucket.name, sorted(files_with_hide))
+        return None
+
+    def _parallel_hide_check(self, account_buckets: list[tuple[Account, list[Bucket]]], max_workers: int) -> list:
+        """Check all buckets for hide markers in parallel."""
+        issues = []
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(self._check_hide_markers, acc, buckets[0]): acc for acc, buckets in account_buckets}
+            for future in as_completed(futures):
+                result = future.result()
+                if result:
+                    issues.append(result)
+        return issues
+
+    def _scan_bucket(self, state: AccountState) -> dict:
+        """Scan single bucket for versions, compute usage, return data for cache merge."""
+        versions_per_file: dict[str, list] = defaultdict(list)
+        scanned_count = 0
+        scan_start = time.monotonic()
+        
+        for f in _iter_file_versions(state.bucket):
+            state.used_bytes += f.size
+            state.file_count += 1
+            versions_per_file[f.file_name].append(f)
+            scanned_count += 1
+            if scanned_count % 1000 == 0:
+                elapsed = time.monotonic() - scan_start
+                log.info("  [%s] Scanned %d files... (%.1fs)", state.account.account_id[:8], scanned_count, elapsed)
+
+        elapsed = time.monotonic() - scan_start
+        log.info("  [%s] Done: %d files (%.1fMB) in '%s' (%.1fs)",
+                 state.account.account_id[:8], scanned_count, state.used_bytes / 1024 / 1024, state.bucket_name, elapsed)
+
+        return {
+            "state": state,
+            "versions_per_file": versions_per_file,
+            "scanned_count": scanned_count,
+        }
+
+    def _parallel_scan_and_validate(self, max_workers: int) -> None:
+        """Scan all buckets in parallel, then merge results and validate consistency."""
+        # name -> [(owning state, latest FileVersion), ...] for files seen in >1 account
+        cross_duplicates: dict[str, list[tuple[AccountState, object]]] = defaultdict(list)
+        latest_versions: dict[str, tuple[AccountState, object]] = {}
+        intra_duplicates: dict[str, dict[str, list]] = defaultdict(dict)
+
+        # Parallel scan
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(self._scan_bucket, state): state for state in self._states}
+            scan_results = [future.result() for future in as_completed(futures)]
+
+        # Merge results and validate
+        for result in scan_results:
+            state = result["state"]
+            versions_per_file = result["versions_per_file"]
+
+            for name, versions in versions_per_file.items():
+                non_hide_versions = [v for v in versions if getattr(v, 'action', 'upload') != 'hide']
+
+                if len(non_hide_versions) > 1:
+                    if state.account.account_id not in intra_duplicates:
+                        intra_duplicates[state.account.account_id] = {}
+                    intra_duplicates[state.account.account_id][name] = non_hide_versions
+
+                if non_hide_versions:
+                    latest = max(non_hide_versions, key=lambda v: v.upload_timestamp)
+                    if name in latest_versions:
+                        if name not in cross_duplicates:
+                            cross_duplicates[name].append(latest_versions[name])
+                        cross_duplicates[name].append((state, latest))
+                    else:
+                        latest_versions[name] = (state, latest)
+                        self._cache[name] = state
 
         # Phase 4: Report intra-account multiple versions
         if intra_duplicates:
