@@ -13,6 +13,7 @@ A minimal, single-process CLI tool for backing up directories to a pool of Backb
 | **Best-fit placement** | Pack files into accounts with least remaining space (bin-packing) |
 | **Strict validation** | Hard stop on any inconsistency (bucket count, versions, duplicates) |
 | **Observable** | Structured logging; `stats` command shows capacity per account |
+| **Parallel startup** | Multi-threaded authorization, validation, and scanning (10 workers default) |
 
 ---
 
@@ -60,8 +61,8 @@ b2backup/
 
 | Module | Responsibility | Key Classes/Functions |
 |--------|----------------|----------------------|
-| `config.py` | Parse `accounts.yaml` | `Account`, `load_config()` |
-| `storage.py` | All B2 logic, cache, routing | `B2AccountPool`, `AccountState`, `BucketValidationError`, `ConsistencyError` |
+| `config.py` | Parse `accounts.yaml` | `Account`, `Config`, `load_config()` |
+| `storage.py` | All B2 logic, cache, routing | `B2AccountPool`, `AccountState`, `BucketValidationError`, `ConsistencyError`, `HideMarkerError`, `ParallelOperationError` |
 | `cli.py` | CLI UX, progress bars, output | `backup`, `restore`, `ls`, `stats` |
 
 ---
@@ -78,38 +79,37 @@ b2backup/
 │  ├─ ls       → list_files() (names from cache, metadata live)   │
 │  └─ stats    → get_pool_stats() (from cache)                    │
 └────────────────────────────────┬────────────────────────────────┘
-                                 │
-                                 ▼
+                                  │
+                                  ▼
 ┌─────────────────────────────────────────────────────────────────┐
 │                      B2AccountPool                               │
 ├─────────────────────────────────────────────────────────────────┤
 │  Startup (strict validation - HARD STOP on any inconsistency):  │
-│  1. Authorize each account_id/account_key                       │
-│  2. list_buckets() → MUST return exactly 1 bucket per account   │
-│     → If ANY account has ≠1 bucket: print offenders → exit 1    │
-│  3. For each bucket: ls(latest_only=False, recursive=True)      │
-│     - Sum used_bytes, file_count (ALL versions count)           │
-│     - If ANY file has >1 version in SAME account:               │
-│       print per-account breakdown → exit 2                      │
-│     - Pick latest version per filename for cross-account check  │
-│  4. Cross-account duplicate check on latest versions            │
-│     → If SAME filename (latest) in ≥2 accounts:                 │
-│       print conflicts with timestamps → exit 2                  │
-│  5. If ALL checks pass: log pool summary → proceed              │
+│  1. PARALLEL: Authorize accounts & discover buckets (10 workers)│
+│  2. Validate bucket counts (must be exactly 1 per account)      │
+│  3. PARALLEL: Check for hide markers (10 workers)               │
+│  4. PARALLEL: Scan versions, build cache, validate (10 workers) │
+│  5. Cross-account duplicate check on latest versions            │
+│  6. If ALL checks pass: log pool summary → proceed              │
 │                                                                  │
 │  Runtime:                                                        │
 │  - _get_eligible_accounts_sorted(size, exclude) → best-fit list │
 │  - upload_file() → try accounts in order (failover on error)    │
 │  - Cache updated on every mutation                              │
 └────────────────────────────────┬────────────────────────────────┘
-                                 │
-                    ┌────────────┼────────────┐
-                    ▼            ▼            ▼
-              ┌─────────┐  ┌─────────┐  ┌─────────┐
-              │Account 1│  │Account 2│  │Account N│
-              │(bucket) │  │(bucket) │  │(bucket) │
-              └─────────┘  └─────────┘  └─────────┘
+                                  │
+                     ┌────────────┼────────────┐
+                     ▼            ▼            ▼
+               ┌─────────┐  ┌─────────┐  ┌─────────┐
+               │Account 1│  │Account 2│  │Account N│
+               │(bucket) │  │(bucket) │  │(bucket) │
+               └─────────┘  └─────────┘  └─────────┘
 ```
+
+**Parallelism**: Startup uses a `ThreadPoolExecutor` with 10 workers (configurable via `max_workers` parameter) to parallelize:
+- Account authorization & bucket discovery
+- Hide marker validation
+- Version scanning & cache building
 
 ---
 
@@ -119,8 +119,8 @@ b2backup/
 ```python
 @dataclass
 class Account:
-    account_id: str          # B2 keyID (e.g., "ce6c123a9349")
-    account_key: str         # B2 applicationKey
+    account_id: str          # B2 account ID (12-char hex)
+    account_key: str         # B2 master application key
     capacity_in_mb: int | None  # Soft limit; None = unlimited
 ```
 
@@ -262,11 +262,11 @@ upload_file tries accounts in that order until an upload succeeds.
 ```
 1. User runs: b2backup --config=accounts.yaml backup /data
 2. CLI creates B2AccountPool(accounts)
-3. Pool authorizes each account (× N)
-4. Pool calls list_buckets() for each account (× N)
-5. CHECK 1: Each account MUST have exactly 1 bucket
+3. PARALLEL: Pool authorizes each account & discovers buckets (× N, 10 workers)
+4. CHECK 1: Each account MUST have exactly 1 bucket
    - If FAIL: Print offender table → exit 1
-6. Pool calls bucket.ls(latest_only=False, recursive=True) for each bucket (× N)
+5. PARALLEL: Pool checks for hide markers in each bucket (× N, 10 workers)
+6. PARALLEL: Pool scans each bucket (latest_only=False, recursive=True) (× N, 10 workers)
 7. Aggregate used_bytes, file_count (ALL versions)
 8. CHECK 2: No file has >1 version in same account
    - If FAIL: Print per-account breakdown → exit 2
@@ -288,7 +288,7 @@ Goal: Pack files tightly, leave large contiguous gaps for future large files.
 For each account with capacity_in_mb set:
     remaining_bytes = capacity_mb * 1024^2 - used_bytes (ALL versions)
 For unlimited accounts:
-    remaining_bytes = ∞ (sorted last)
+    remaining_bytes = UNLIMITED_REMAINING (sorted last)
 
 remaining_files = 1700 - file_count (ALL versions count)
 
